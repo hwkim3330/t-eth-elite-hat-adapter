@@ -1,6 +1,6 @@
 # Vendored LilyGo mechanical files, and the script that reads them
 
-Everything dimensional in `../t_eth_elite_hat_adapter/GEOMETRY.md` — and so the
+Everything dimensional in `../pcb/GEOMETRY.md` — and so the
 adapter PCB and the printed tray that depend on it — traces back to the three
 files in this folder. They are vendored rather than linked so the numbers stay
 reproducible if LilyGo reorganise their repo.
@@ -51,7 +51,7 @@ It prints, straight out of the vendor files:
 
 It does not write anything or edit GEOMETRY.md. Compare by eye; if a number has
 drifted, GEOMETRY.md is what needs updating, and every consumer of it
-(`../t_eth_elite_hat_adapter/make_board.py`, `../case/case.py`) re-runs from
+(`../pcb/make_board.py`, `../case/case.py`) re-runs from
 constants, not from hand-copied values.
 
 ## The one thing it cannot check

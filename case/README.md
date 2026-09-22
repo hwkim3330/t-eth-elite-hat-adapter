@@ -33,7 +33,7 @@ dressed up as a design, so the tray stops below it.
 ## What the shape is actually doing
 
 Every opening exists because of a specific part measured out of LilyGo's model
-(see `../t_eth_elite_hat_adapter/GEOMETRY.md`):
+(see `../pcb/GEOMETRY.md`):
 
 | feature | why |
 |---|---|

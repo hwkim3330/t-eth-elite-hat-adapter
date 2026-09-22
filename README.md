@@ -19,7 +19,7 @@ than a Raspberry Pi. Firmware side lives in
 | `pcb/` | the adapter board — KiCad project, gerbers, BOM/CPL |
 | `case/` | printed base tray for the Elite, generated and clearance-checked by script |
 | `reference/` | LilyGo's own DXF and 3D models, plus the script that re-derives every dimension from them |
-| `pcb/GEOMETRY.md` | **the single source of truth** — every measured number, with its provenance |
+| [`pcb/GEOMETRY.md`](pcb/GEOMETRY.md) | **the single source of truth** — every measured number, with its provenance |
 
 ## The short version of why this exists
 
@@ -60,7 +60,7 @@ python3 reference/measure.py
 
 The one number that is *not* from CAD is the HAT's own 58 × 49 hole pattern,
 which is inferred from a product photo (method and error bars in
-`pcb/GEOMETRY.md`). Only the placement of the adapter's two far holes depends
+[`pcb/GEOMETRY.md`](pcb/GEOMETRY.md)). Only the placement of the adapter's two far holes depends
 on it.
 
 ## Status
@@ -68,5 +68,5 @@ on it.
 Designed, checked, **never built**. No board has been fabricated, nothing has
 been printed, and no part of the stack has been assembled or powered. The
 clearance check the case script runs is against LilyGo's model, not against a
-real board. Read the "not verified" sections in `pcb/README.md` and
-`case/README.md` before spending money.
+real board. Read the "not verified" sections in [`pcb/README.md`](pcb/README.md) and
+[`case/README.md`](case/README.md) before spending money.
