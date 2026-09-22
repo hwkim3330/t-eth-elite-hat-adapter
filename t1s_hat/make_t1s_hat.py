@@ -1,0 +1,1775 @@
+#!/usr/bin/env python3
+"""
+Generate the T1S HAT: symbol library, schematic, PCB, and all fab outputs.
+
+Run:  python3 make_t1s_hat.py      (KiCad 7 pcbnew Python bindings required)
+
+Sources of truth, in this order:
+  ../pcb/GEOMETRY.md   mechanical   (outline, holes, 2x20 grid) -- inherited
+  ELECTRICAL.md        electrical   (every part, value and pin rule)
+
+Nothing in either file is re-derived here.  Deviations from them that were
+directed by the project owner after those files were written are marked
+"DIRECTED:" in the comments and are listed in README.md.
+
+COORDINATE FRAME -- read before touching a number
+-------------------------------------------------
+GEOMETRY.md's frame ("G frame"): T-ETH-Elite top view, origin at the Elite's
+PCB bottom-left corner, +x right, +y UP.  KiCad's PCB frame has +y DOWN.
+The single conversion is kx()/ky()/V(); the G origin sits at KiCad (100,100).
+Same convention as ../pcb/make_board.py, from which the mechanical code here
+is reused.
+"""
+
+import csv
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import uuid as _uuid
+import zipfile
+
+import pcbnew
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+NAME = "t1s_hat"
+PCB_PATH = os.path.join(HERE, NAME + ".kicad_pcb")
+SCH_PATH = os.path.join(HERE, NAME + ".kicad_sch")
+PRO_PATH = os.path.join(HERE, NAME + ".kicad_pro")
+SYMDIR = os.path.join(HERE, "sym")
+SYMLIB = os.path.join(SYMDIR, "t1s_hat.kicad_sym")
+
+KSYM = "/usr/share/kicad/symbols/"
+KFP = "/usr/share/kicad/footprints/"
+
+# ---------------------------------------------------------------- frame ----
+ORIGIN_X = 100.0
+ORIGIN_Y = 100.0
+
+
+def kx(gx):
+    return ORIGIN_X + gx
+
+
+def ky(gy):
+    return ORIGIN_Y - gy
+
+
+def V(gx, gy):
+    return pcbnew.VECTOR2I(pcbnew.FromMM(kx(gx)), pcbnew.FromMM(ky(gy)))
+
+
+def MM(v):
+    return pcbnew.FromMM(v)
+
+
+def SZ(w, h):
+    return pcbnew.VECTOR2I(pcbnew.FromMM(w), pcbnew.FromMM(h))
+
+
+def gof(pt):
+    """KiCad VECTOR2I -> G-frame (x, y) in mm."""
+    return (pcbnew.ToMM(pt.x) - ORIGIN_X, ORIGIN_Y - pcbnew.ToMM(pt.y))
+
+
+# ------------------------------------------------- GEOMETRY.md mechanical --
+# DIRECTED: the RJ45 notch is dropped; this board is lifted clear of the jack
+# by a taller riser instead, so the outline is the plain rectangle.  Every
+# other mechanical number below is GEOMETRY.md's, unchanged.
+BOARD_W = 66.22
+BOARD_H = 49.19
+CORNER_R = 3.0
+BOARD_T = 1.6
+
+HOLE_D = 2.75
+HOLES = [
+    ("H1", 3.33, 4.63, "T-ETH-Elite bottom-left"),
+    ("H2", 61.33, 4.63, "T-ETH-Elite bottom-right"),
+    ("H3", 2.98, 46.23, "T-ETH-Elite top-left"),
+    ("H4", 63.23, 46.20, "T-ETH-Elite top-right"),
+]
+
+HDR_X0 = 8.196
+HDR_PITCH = 2.54
+HDR_ROW_ODD = 3.360
+HDR_ROW_EVEN = 5.900
+
+
+def pin_xy(pin):
+    """G-frame (x, y) of 40-pin header pin `pin` (1..40)."""
+    k = (pin - 1) // 2
+    return HDR_X0 + HDR_PITCH * k, (HDR_ROW_ODD if pin % 2 else HDR_ROW_EVEN)
+
+
+# ELECTRICAL.md: the Elite's WROOM antenna sits under this board here.
+KEEPOUT = (58.0, 22.0, 66.22, 44.0)       # x0, y0, x1, y1
+
+EDGE_W = 0.10
+SILK_W = 0.15
+
+
+# ===========================================================================
+#  THE CIRCUIT -- one table, used for the symbol library, the schematic and
+#  the PCB, so the three cannot disagree.
+# ===========================================================================
+
+# LAN8651, 32-VQFN 5x5, exposed pad = VSS.  Pin table verbatim from
+# ELECTRICAL.md.  Columns: number, name, electrical type, symbol side.
+#   side: L/R/T/B on the schematic symbol body.
+LAN8651_PINS = [
+    # --- host SPI + reset, left of the symbol -----------------------------
+    (11, "CS_N",     "input",          "L", 22.86),
+    (12, "SCLK",     "input",          "L", 20.32),
+    (13, "SDI",      "input",          "L", 17.78),
+    (10, "SDO",      "output",         "L", 15.24),
+    (9,  "IRQ_N",    "open_collector", "L", 12.70),
+    (8,  "RESET_N",  "input",          "L",  7.62),
+    # --- config / analogue, left ------------------------------------------
+    (4,  "TEST",     "input",          "L",  2.54),
+    (27, "XTI",      "passive",        "L", -2.54),
+    (28, "XTO",      "output",         "L", -5.08),
+    (26, "RBIAS",    "passive",        "L", -10.16),
+    (21, "CCOMP",    "passive",        "L", -12.70),
+    # --- bus, right --------------------------------------------------------
+    (30, "TRXP",     "bidirectional",  "R", 22.86),
+    (31, "TRXN",     "bidirectional",  "R", 20.32),
+    # --- configurable IO, right -------------------------------------------
+    (18, "DIOA0",    "bidirectional",  "R", 15.24),
+    (19, "DIOA1",    "bidirectional",  "R", 12.70),
+    (20, "DIOA2",    "bidirectional",  "R", 10.16),
+    (22, "DIOA3",    "bidirectional",  "R",  7.62),
+    (23, "DIOA4",    "bidirectional",  "R",  5.08),
+    (16, "DIOB0",    "bidirectional",  "R",  2.54),
+    (14, "DIOB1",    "bidirectional",  "R",  0.00),
+    # --- power management / unused, right ---------------------------------
+    (32, "WAKE_IN",  "input",          "R", -5.08),
+    (24, "WAKE_OUT", "output",         "R", -7.62),
+    (1,  "INH",      "open_collector", "R", -10.16),
+    (6,  "DNC",      "passive",        "R", -15.24),
+    (15, "DNC",      "passive",        "R", -17.78),
+    # --- supplies, top -----------------------------------------------------
+    (7,  "VDDP",     "power_in",       "T", -7.62),
+    (17, "VDDP",     "power_in",       "T", -2.54),
+    (29, "VDDA",     "power_in",       "T",  2.54),
+    (25, "VDDAU",    "power_in",       "T",  7.62),
+    # --- grounds, bottom ---------------------------------------------------
+    (2,  "VSS",      "power_in",       "B", -7.62),
+    (3,  "VSS",      "power_in",       "B", -2.54),
+    (5,  "VSS",      "power_in",       "B",  2.54),
+    (33, "VSS_EP",   "power_in",       "B",  7.62),
+]
+
+# The 40-pin host header.  Pin electrical types say who drives what: this is
+# the ESP32-S3 side, so the six signals ELECTRICAL.md assigns are declared
+# output/input accordingly and the rest are passive.  Names are the Raspberry
+# Pi names, which is what ELECTRICAL.md's host-interface table uses.
+RPI_NAMES = {
+    1: "3V3", 2: "5V", 3: "GPIO2/SDA1", 4: "5V", 5: "GPIO3/SCL1", 6: "GND",
+    7: "GPIO4", 8: "GPIO14/TXD", 9: "GND", 10: "GPIO15/RXD", 11: "GPIO17",
+    12: "GPIO18", 13: "GPIO27", 14: "GND", 15: "GPIO22", 16: "GPIO23",
+    17: "3V3", 18: "GPIO24", 19: "GPIO10/MOSI", 20: "GND", 21: "GPIO9/MISO",
+    22: "GPIO25", 23: "GPIO11/SCLK", 24: "GPIO8/CE0", 25: "GND",
+    26: "GPIO7/CE1", 27: "ID_SD", 28: "ID_SC", 29: "GPIO5", 30: "GND",
+    31: "GPIO6", 32: "GPIO12", 33: "GPIO13", 34: "GND", 35: "GPIO19",
+    36: "GPIO16", 37: "GPIO26", 38: "GPIO20", 39: "GND", 40: "GPIO21",
+}
+HDR_DRIVEN = {15: "output", 16: "input", 19: "output", 21: "input",
+              23: "output", 24: "output"}
+HDR_GND = [6, 9, 14, 20, 25, 30, 34, 39]
+HDR_3V3 = [1, 17]
+
+# Net attached to each header pin; None => no-connect.
+HDR_NET = {}
+for _p in range(1, 41):
+    HDR_NET[_p] = None
+for _p in HDR_GND:
+    HDR_NET[_p] = "GND"
+for _p in HDR_3V3:
+    HDR_NET[_p] = "+3V3"
+HDR_NET.update({15: "RESET_N", 16: "IRQ_N", 19: "SPI_MOSI",
+                21: "SPI_MISO", 23: "SPI_SCLK", 24: "SPI_CS_N"})
+
+# LAN8651 pin -> net; None => no-connect (no copper stub either).
+U1_NET = {
+    1: None,            # INH   DS60001734F Tbl 3-5: "left unconnected" if unused
+    2: "GND", 3: "GND", 5: "GND",
+    4: "VDDP",          # TEST  "must be connected to VDDP"
+    6: None, 15: None,  # DNC   "must be left floating externally"
+    7: "VDDP", 17: "VDDP",
+    8: "RESET_N", 9: "IRQ_N", 10: "SPI_MISO", 11: "SPI_CS_N",
+    12: "SPI_SCLK", 13: "SPI_MOSI",
+    14: "GND", 16: "GND",          # DIOB1 "connected directly to ground"
+    18: "LED0_K", 19: "LED1_K",
+    20: "GND", 22: "GND", 23: "GND",   # DIOA2/3/4 unused -> ground
+    21: "CCOMP",
+    24: None,           # WAKE_OUT "should be left unconnected"
+    25: "VDDAU", 26: "RBIAS", 27: "XTI", 28: "XTO", 29: "VDDA",
+    30: "TRXP", 31: "TRXN",
+    32: "GND",          # WAKE_IN  "should be connected to VSS"
+    33: "GND",          # exposed pad
+}
+
+FP_C0603 = "Capacitor_SMD:C_0603_1608Metric"
+FP_C0805 = "Capacitor_SMD:C_0805_2012Metric"
+FP_R0603 = "Resistor_SMD:R_0603_1608Metric"
+FP_R0805 = "Resistor_SMD:R_0805_2012Metric"
+FP_R1206 = "Resistor_SMD:R_1206_3216Metric"
+FP_L0603 = "Inductor_SMD:L_0603_1608Metric"
+FP_LED = "LED_SMD:LED_0603_1608Metric"
+
+# ---------------------------------------------------------------------------
+# PARTS.  Each entry:
+#   ref, lib_id, value, footprint, {pin: net}, (pcb_x, pcb_y, pcb_rot),
+#   (sch_x, sch_y), dnp, description, lcsc
+# pcb_rot is in KiCad degrees and is checked by reading the pads back.
+# ---------------------------------------------------------------------------
+P = []
+
+
+def part(ref, lib_id, value, fp, nets, pcb, sch, dnp=False, descr="", lcsc=""):
+    P.append(dict(ref=ref, lib_id=lib_id, value=value, fp=fp, nets=nets,
+                  pcb=pcb, sch=sch, dnp=dnp, descr=descr, lcsc=lcsc))
+
+
+part("U1", "t1s_hat:LAN8651",
+     "LAN8651",
+     "Package_DFN_QFN:TQFN-32-1EP_5x5mm_P0.5mm_EP3.4x3.4mm_ThermalVias",
+     U1_NET, (30.0, 20.0, 0), (175.0, 130.0),
+     descr="Microchip LAN8651 10BASE-T1S MAC-PHY, OPEN Alliance TC6 SPI, "
+           "32-VQFN 5x5 (internal 1.8 V core LDO -> single 3.3 V rail)")
+
+part("J1", "t1s_hat:HAT_HEADER_2x20",
+     "2x20 socket (riser stack)",
+     "Connector_PinHeader_2.54mm:PinHeader_2x20_P2.54mm_Vertical",
+     HDR_NET, (0, 0, 0), (60.0, 120.0),
+     descr="2x20 2.54 mm THT socket; mates with the riser that plugs onto "
+           "the T-ETH-Elite's own 9.30 mm header pins")
+
+# --- bus interface network, AN1718 order: CMC - caps - term - ESD - CN1 -----
+part("L1", "Device:L_Coupled_1243", "130uH @ 100kHz CMC",
+     "Inductor_SMD:L_CommonMode_Wurth_WE-CNSW-1206",
+     {1: "TRXN", 2: "CMC_N", 3: "CMC_P", 4: "TRXP"},
+     (28.5, 26.6, 90), (250.0, 100.0),
+     descr="Common-mode choke, 130 uH @ 100 kHz (AN1718 L1). ALWAYS FITTED.")
+part("C1", "Device:C", "100nF/100V", FP_C0805,
+     {1: "CMC_P", 2: "BUS_P"}, (29.5, 30.8, 90), (250.0, 118.0),
+     descr="AC coupling / galvanic isolation, bus P. ALWAYS FITTED (AN1718)")
+part("C2", "Device:C", "100nF/100V", FP_C0805,
+     {1: "CMC_N", 2: "BUS_N"}, (27.5, 30.8, 90), (250.0, 136.0),
+     descr="AC coupling / galvanic isolation, bus N. ALWAYS FITTED (AN1718)")
+part("R1", "Device:R", "49R9 1% 1W (DNP)", FP_R1206,
+     {1: "BUS_P", 2: "BUS_CT"}, (32, 34.2, 180), (288.0, 112.0), dnp=True,
+     descr="Bus termination, P leg. 49R9 1% 1W for an END node, 1K5 1% for "
+           "a DROP node. Shipped unstuffed - see README.")
+part("R2", "Device:R", "49R9 1% 1W (DNP)", FP_R1206,
+     {1: "BUS_N", 2: "BUS_CT"}, (25, 34.2, 0), (288.0, 142.0), dnp=True,
+     descr="Bus termination, N leg. 49R9 1% 1W for an END node, 1K5 1% for "
+           "a DROP node. Shipped unstuffed - see README.")
+part("R3", "Device:R", "100k 5%", FP_R0805,
+     {1: "BUS_CT", 2: "GND"}, (30.9, 37, 0), (300.0, 127.0),
+     descr="Common-mode termination, centre tap to ground (AN1718 R3)")
+part("C3", "Device:C", "100nF/100V", FP_C0805,
+     {1: "BUS_CT", 2: "GND"}, (26.1, 37, 180), (312.0, 127.0),
+     descr="Common-mode termination, centre tap to ground (AN1718 C3)")
+part("MOV1", "Device:Varistor", "ESD 1206 (DNP)", FP_R1206,
+     {1: "BUS_P", 2: "GND"}, (37.5, 37, 0), (330.0, 112.0), dnp=True,
+     descr="ESD element on bus P, at the connector (AN1718 MOV1). Optional.")
+part("MOV2", "Device:Varistor", "ESD 1206 (DNP)", FP_R1206,
+     {1: "BUS_N", 2: "GND"}, (21, 37, 180), (330.0, 142.0), dnp=True,
+     descr="ESD element on bus N, at the connector (AN1718 MOV2). Optional.")
+part("CN1", "Connector_Generic:Conn_01x04", "T1S BUS  P N N P",
+     "Connector_Phoenix_MC:PhoenixContact_MC_1,5_4-G-3.81_1x04_"
+     "P3.81mm_Horizontal",
+     {1: "BUS_P", 2: "BUS_N", 3: "BUS_N", 4: "BUS_P"},
+     (30.405, 41, 180), (360.0, 127.0),
+     descr="MDI connector, 4-pin 3.81 mm pluggable terminal block. "
+           "Pins 1..4 = P N N P; the two P and the two N are shorted on "
+           "board so the node taps a daisy chain.")
+
+# --- clock -----------------------------------------------------------------
+part("Y1", "Device:Crystal", "25.000MHz",
+     "Crystal:Crystal_SMD_3215-2Pin_3.2x1.5mm",
+     {1: "XTI", 2: "XTO"}, (36.9, 26.6, 0), (120.0, 170.0),
+     descr="25.000 MHz fundamental parallel-resonant crystal, CL 18 pF, "
+           "low ESR. No series or feedback resistor (data sheet).")
+part("C15", "Device:C", "18pF", FP_C0603,
+     {1: "XTO", 2: "GND"}, (35.65, 29.4, 90), (104.0, 178.0),
+     descr="Crystal load capacitor C1 (data sheet: C1 = C2 = 18 pF)")
+part("C16", "Device:C", "18pF", FP_C0603,
+     {1: "XTI", 2: "GND"}, (38.15, 29.4, 90), (136.0, 178.0),
+     descr="Crystal load capacitor C2 (data sheet: C1 = C2 = 18 pF)")
+
+# --- analogue reference ----------------------------------------------------
+part("R7", "Device:R", "12k4 1%", FP_R0603,
+     {1: "RBIAS", 2: "GND"}, (41.0, 26.8, 90), (120.0, 200.0),
+     descr="RBIAS. 12.4 kohm 1% over the whole operating temperature range "
+           "- no substitutions (data sheet).")
+
+# --- supplies --------------------------------------------------------------
+part("FB1", "Device:FerriteBead", "0R (FB opt.)", FP_L0603,
+     {1: "+3V3", 2: "VDDA"}, (33.0, 30.4, 270), (60.0, 60.0),
+     descr="VDDA supply island option: 0 ohm fitted; may be replaced by a "
+           "~300 ohm @ 100 MHz bead (e.g. Wuerth 742792640).")
+part("FB2", "Device:FerriteBead", "0R (FB opt.)", FP_L0603,
+     {1: "+3V3", 2: "VDDAU"}, (44, 29.5, 270), (60.0, 90.0),
+     descr="VDDAU supply island option: 0 ohm fitted.")
+part("FB3", "Device:FerriteBead", "0R (FB opt.)", FP_L0603,
+     {1: "+3V3", 2: "VDDP"}, (18, 12, 0), (60.0, 30.0),
+     descr="VDDP supply island option: 0 ohm fitted.")
+part("C6", "Device:C", "10uF", FP_C0805,
+     {1: "+3V3", 2: "GND"}, (16, 18, 0), (40.0, 45.0),
+     descr="Bulk decoupling on the 3.3 V supply side")
+
+# per-pin decoupling: 0.1 uF + 0.01 uF at EACH power pin, 0.01 nearest
+part("C7", "Device:C", "100nF", FP_C0603,
+     {1: "VDDP", 2: "GND"}, (19.8, 13.6, 0), (90.0, 45.0),
+     descr="VDDP (pin 7) decoupling, 0.1 uF")
+part("C8", "Device:C", "10nF", FP_C0603,
+     {1: "VDDP", 2: "GND"}, (20.5, 16, 0), (105.0, 45.0),
+     descr="VDDP (pin 7) decoupling, 0.01 uF - closest to the pin")
+part("C9", "Device:C", "100nF", FP_C0603,
+     {1: "VDDP", 2: "GND"}, (45, 9.5, 0), (120.0, 45.0),
+     descr="VDDP (pin 17) decoupling, 0.1 uF")
+part("C10", "Device:C", "10nF", FP_C0603,
+     {1: "VDDP", 2: "GND"}, (42, 9.5, 180), (135.0, 45.0),
+     descr="VDDP (pin 17) decoupling, 0.01 uF - closest to the pin")
+part("C11", "Device:C", "100nF", FP_C0603,
+     {1: "VDDA", 2: "GND"}, (31.6, 28, 180), (150.0, 45.0),
+     descr="VDDA (pin 29) decoupling, 0.1 uF")
+part("C12", "Device:C", "10nF", FP_C0603,
+     {1: "VDDA", 2: "GND"}, (31.6, 26.4, 180), (165.0, 45.0),
+     descr="VDDA (pin 29) decoupling, 0.01 uF - closest to the pin")
+part("C13", "Device:C", "100nF", FP_C0603,
+     {1: "VDDAU", 2: "GND"}, (47.5, 27.6, 0), (180.0, 45.0),
+     descr="VDDAU (pin 25) decoupling, 0.1 uF")
+part("C14", "Device:C", "10nF", FP_C0603,
+     {1: "VDDAU", 2: "GND"}, (47.5, 26, 0), (195.0, 45.0),
+     descr="VDDAU (pin 25) decoupling, 0.01 uF - closest to the pin")
+part("C4", "Device:C", "4.7uF low-ESR", FP_C0805,
+     {1: "CCOMP", 2: "GND"}, (39.5, 20.55, 0), (215.0, 45.0),
+     descr="CCOMP: internal +1.8 V core LDO compensation. REQUIRED, low ESR, "
+           "to the ground plane (LAN8651 only).")
+part("C5", "Device:C", "100nF", FP_C0603,
+     {1: "CCOMP", 2: "GND"}, (35.4, 21, 0), (232.0, 45.0),
+     descr="CCOMP support capacitor (data sheet: useful, not required)")
+
+# --- host-side pull-ups ----------------------------------------------------
+part("R4", "Device:R", "10k", FP_R0603,
+     {1: "+3V3", 2: "RESET_N"}, (24, 15, 0), (95.0, 95.0),
+     descr="RESET_N pull-up: a floating host GPIO during ESP32 boot must not "
+           "hold the PHY in reset")
+part("R5", "Device:R", "10k", FP_R0603,
+     {1: "+3V3", 2: "SPI_CS_N"}, (50, 12.4, 180), (95.0, 105.0),
+     descr="SPI CS_N pull-up")
+part("R6", "Device:R", "10k", FP_R0603,
+     {1: "+3V3", 2: "IRQ_N"}, (28.6, 12.4, 180), (95.0, 115.0),
+     descr="IRQ_N pull-up (open-drain capable interrupt output)")
+
+# --- status LEDs -----------------------------------------------------------
+part("R8", "Device:R", "1k", FP_R0603,
+     {1: "+3V3", 2: "LED0_A"}, (47.5, 19, 180), (330.0, 60.0),
+     descr="LED0 series resistor to 3V3 (DIOA0 sinks)")
+part("D1", "Device:LED", "GRN", FP_LED,
+     {2: "LED0_A", 1: "LED0_K"}, (44, 19, 0), (345.0, 60.0),
+     descr="Status LED 0 on DIOA0 - firmware maps it (e.g. PLCA status)")
+part("R9", "Device:R", "1k", FP_R0603,
+     {1: "+3V3", 2: "LED1_A"}, (47.5, 21.5, 180), (330.0, 75.0),
+     descr="LED1 series resistor to 3V3 (DIOA1 sinks)")
+part("D2", "Device:LED", "YEL", FP_LED,
+     {2: "LED1_A", 1: "LED1_K"}, (44, 21.5, 0), (345.0, 75.0),
+     descr="Status LED 1 on DIOA1 - firmware maps it (e.g. activity)")
+
+BY_REF = {p["ref"]: p for p in P}
+
+# Nets that get a PWR_FLAG on the schematic: their only drivers on this board
+# are passive (the header, or a 0 ohm bead), so ERC needs to be told they are
+# supplies.
+PWR_FLAG_NETS = ["+3V3", "GND", "VDDP", "VDDA", "VDDAU"]
+
+
+# ===========================================================================
+#  SYMBOL LIBRARY -- LAN8651 (no KiCad symbol exists) + the host header
+# ===========================================================================
+FONT = '(effects (font (size 1.27 1.27)))'
+
+
+def _pin(etype, x, y, ang, length, name, number, hide=False):
+    h = " hide" if hide else ""
+    return ('      (pin %s line (at %.4f %.4f %d) (length %.2f)%s\n'
+            '        (name "%s" (effects (font (size 1.27 1.27))))\n'
+            '        (number "%s" (effects (font (size 1.27 1.27))))\n'
+            '      )\n' % (etype, x, y, ang, length, h, name, number))
+
+
+def _rect(x1, y1, x2, y2):
+    return ('      (rectangle (start %.3f %.3f) (end %.3f %.3f)\n'
+            '        (stroke (width 0.254) (type default))\n'
+            '        (fill (type background))\n'
+            '      )\n' % (x1, y1, x2, y2))
+
+
+def _prop(key, val, x, y, hide=False, just=None):
+    e = '(effects (font (size 1.27 1.27))'
+    if just:
+        e += ' (justify %s)' % just
+    if hide:
+        e += ' hide'
+    e += ')'
+    return '      (property "%s" "%s" (at %.3f %.3f 0)\n        %s\n      )\n' \
+        % (key, val, x, y, e)
+
+
+def build_lan8651_symbol():
+    XL, XR, YT, YB = -19.05, 19.05, 27.94, -27.94
+    LEN = 3.81
+    s = '    (symbol "LAN8651" (in_bom yes) (on_board yes)\n'
+    s += _prop("Reference", "U", XL, YT + 2.54, just="left")
+    s += _prop("Value", "LAN8651", XL, YT + 5.08, just="left")
+    s += _prop("Footprint",
+               "Package_DFN_QFN:TQFN-32-1EP_5x5mm_P0.5mm_EP3.4x3.4mm"
+               "_ThermalVias", 0, 0, hide=True)
+    s += _prop("Datasheet", "https://www.microchip.com/DS60001734", 0, 0,
+               hide=True)
+    s += _prop("Description",
+               "10BASE-T1S MAC-PHY with OPEN Alliance TC6 SPI, 32-VQFN",
+               0, 0, hide=True)
+    s += '      (symbol "LAN8651_0_1"\n' + _rect(XL, YT, XR, YB) + '      )\n'
+    s += '      (symbol "LAN8651_1_1"\n'
+    for num, name, etype, side, coord in LAN8651_PINS:
+        if side == "L":
+            s += _pin(etype, XL - LEN, coord, 0, LEN, name, str(num))
+        elif side == "R":
+            s += _pin(etype, XR + LEN, coord, 180, LEN, name, str(num))
+        elif side == "T":
+            s += _pin(etype, coord, YT + LEN, 270, LEN, name, str(num))
+        else:
+            s += _pin(etype, coord, YB - LEN, 90, LEN, name, str(num))
+    s += '      )\n    )\n'
+    return s
+
+
+def build_header_symbol():
+    """2x20 host header.  Pin electrical types declare the ESP32-S3 side as
+    the driver of the six signals ELECTRICAL.md assigns, so ERC sees the SPI
+    inputs of U1 as driven.  Everything else is passive."""
+    XL, XR = -10.16, 10.16
+    LEN = 3.81
+    top = 25.4
+    s = '    (symbol "HAT_HEADER_2x20" (in_bom yes) (on_board yes)\n'
+    s += _prop("Reference", "J", XL, top + 5.08, just="left")
+    s += _prop("Value", "HAT_HEADER_2x20", XL, top + 2.54, just="left")
+    s += _prop("Footprint",
+               "Connector_PinHeader_2.54mm:PinHeader_2x20_P2.54mm_Vertical",
+               0, 0, hide=True)
+    s += _prop("Datasheet", "", 0, 0, hide=True)
+    s += _prop("Description",
+               "40-pin Raspberry-Pi-compatible host header on the "
+               "LilyGO T-ETH-Elite", 0, 0, hide=True)
+    s += '      (symbol "HAT_HEADER_2x20_0_1"\n'
+    s += _rect(XL, top, XR, top - 21 * 2.54) + '      )\n'
+    s += '      (symbol "HAT_HEADER_2x20_1_1"\n'
+    for p in range(1, 41):
+        k = (p - 1) // 2
+        y = top - 2.54 * (k + 1)
+        et = HDR_DRIVEN.get(p, "passive")
+        if p in HDR_3V3 or p in HDR_GND or p in (2, 4):
+            et = "passive"
+        if p % 2:
+            s += _pin(et, XL - LEN, y, 0, LEN, RPI_NAMES[p], str(p))
+        else:
+            s += _pin(et, XR + LEN, y, 180, LEN, RPI_NAMES[p], str(p))
+    s += '      )\n    )\n'
+    return s
+
+
+def write_symbol_lib():
+    os.makedirs(SYMDIR, exist_ok=True)
+    s = '(kicad_symbol_lib (version 20220914) (generator t1s_hat)\n'
+    s += build_lan8651_symbol()
+    s += build_header_symbol()
+    s += ')\n'
+    with open(SYMLIB, "w") as f:
+        f.write(s)
+    print("wrote %s" % SYMLIB)
+
+
+# ===========================================================================
+#  s-expression helpers: pull a symbol definition out of a .kicad_sym
+# ===========================================================================
+_SYM_CACHE = {}
+
+
+def _read_lib(path):
+    if path not in _SYM_CACHE:
+        _SYM_CACHE[path] = open(path).read()
+    return _SYM_CACHE[path]
+
+
+def sym_block(lib_id):
+    """Return (raw_block_text, pins) for 'Lib:Name'.  pins is a list of
+    dicts: number, name, etype, x, y, ang (library coords, y up)."""
+    lib, name = lib_id.split(":", 1)
+    path = SYMLIB if lib == "t1s_hat" else KSYM + lib + ".kicad_sym"
+    txt = _read_lib(path)
+    tok = '(symbol "%s" ' % name
+    i = txt.find(tok)
+    if i < 0:
+        raise RuntimeError("symbol %s not in %s" % (name, path))
+    depth, j = 0, i
+    while True:
+        c = txt[j]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        elif c == '"':
+            j += 1
+            while txt[j] != '"':
+                j += 2 if txt[j] == '\\' else 1
+        j += 1
+    block = txt[i:j]
+
+    pins = []
+    for m in re.finditer(
+            r'\(pin\s+(\S+)\s+(\S+)\s+\(at\s+(-?[\d.]+)\s+(-?[\d.]+)\s+'
+            r'(-?[\d.]+)\)\s+\(length\s+([\d.]+)\)(\s+hide)?\s*'
+            r'\(name\s+"((?:[^"\\]|\\.)*)"', block):
+        rest = block[m.end():]
+        nm = re.search(r'\(number\s+"((?:[^"\\]|\\.)*)"', rest)
+        pins.append(dict(number=nm.group(1), name=m.group(8),
+                         etype=m.group(1),
+                         x=float(m.group(3)), y=float(m.group(4)),
+                         ang=int(float(m.group(5))),
+                         length=float(m.group(6))))
+    # de-duplicate: alternate body styles repeat pin numbers
+    seen, out = set(), []
+    for p in pins:
+        if p["number"] in seen:
+            continue
+        seen.add(p["number"])
+        out.append(p)
+    return block, out
+
+
+def lib_symbol_for_sch(lib_id):
+    """Re-emit a library symbol with its lib-qualified name, for the
+    schematic's (lib_symbols) block."""
+    block, _ = sym_block(lib_id)
+    name = lib_id.split(":", 1)[1]
+    return block.replace('(symbol "%s" ' % name, '(symbol "%s" ' % lib_id, 1)
+
+
+# ===========================================================================
+#  SCHEMATIC
+# ===========================================================================
+# Sheet placement, revised as a block so the circuit reads in groups:
+#   y  30..60   supply rail, ferrite islands and every decoupling pair
+#   y  95..165  host header (left), pull-ups, LAN8651 (centre)
+#   y 100..140  bus interface network (right), in AN1718 order
+#   y 185..215  clock, RBIAS, status LEDs
+SCH_POS = {
+    "C6": (40, 45),  "FB3": (62, 45),  "C7": (86, 45),  "C8": (101, 45),
+    "C9": (116, 45), "C10": (131, 45),
+    "FB1": (158, 45), "C11": (182, 45), "C12": (197, 45),
+    "FB2": (222, 45), "C13": (246, 45), "C14": (261, 45),
+    "C4": (290, 45), "C5": (305, 45),
+    "J1": (60, 130),
+    "R4": (110, 100), "R5": (110, 125), "R6": (110, 150),
+    "U1": (190, 130),
+    "L1": (275, 105), "C1": (300, 95), "C2": (300, 125),
+    "R1": (325, 100), "R2": (325, 138), "R3": (345, 119), "C3": (362, 119),
+    "MOV1": (385, 100), "MOV2": (385, 138), "CN1": (420, 119),
+    "Y1": (150, 200), "C15": (133, 210), "C16": (167, 210),
+    "R7": (200, 200),
+    "R8": (285, 195), "D1": (305, 195), "R9": (285, 215), "D2": (305, 215),
+}
+def snap(v):
+    """KiCad's schematic connection grid is 50 mil = 1.27 mm.  Every symbol
+    origin is snapped to it, otherwise ERC fills up with endpoint_off_grid."""
+    return round(v / 1.27) * 1.27
+
+
+for _p in P:
+    if _p["ref"] in SCH_POS:
+        _p["sch"] = tuple(snap(v) for v in SCH_POS[_p["ref"]])
+
+SHEET_UUID = "5f3b7c10-1a2b-4c3d-8e9f-0a1b2c3d4e50"
+
+
+def _u(seed):
+    return str(_uuid.uuid5(_uuid.UUID(SHEET_UUID), seed))
+
+
+def sch_pin_pos(part, pin):
+    """Sheet (x, y) of a pin, and its outward unit direction (dx, dy).
+    All symbols are placed unrotated, so the only transform is the y flip."""
+    _, pins = sym_block(part["lib_id"])
+    pd = [q for q in pins if q["number"] == str(pin)][0]
+    X, Y = part["sch"]
+    px, py = X + pd["x"], Y - pd["y"]
+    d = {0: (-1, 0), 180: (1, 0), 90: (0, 1), 270: (0, -1)}[pd["ang"] % 360]
+    return px, py, d
+
+
+SCH = []
+
+
+def w(a, b, seed):
+    SCH.append('  (wire (pts (xy %.2f %.2f) (xy %.2f %.2f))\n'
+               '    (stroke (width 0) (type default)) (uuid %s)\n  )\n'
+               % (a[0], a[1], b[0], b[1], _u("w" + seed)))
+
+
+def lbl(x, y, txt, d, seed):
+    ang, just = (0, "left") if d[0] >= 0 else (0, "right")
+    if d[1] > 0:
+        ang, just = 270, "right"
+    elif d[1] < 0:
+        ang, just = 90, "left"
+    SCH.append('  (label "%s" (at %.2f %.2f %d)\n'
+               '    (effects (font (size 1.27 1.27)) (justify %s bottom))\n'
+               '    (uuid %s)\n  )\n' % (txt, x, y, ang, just, _u("l" + seed)))
+
+
+def nc(x, y, seed):
+    SCH.append('  (no_connect (at %.2f %.2f) (uuid %s))\n'
+               % (x, y, _u("n" + seed)))
+
+
+def sch_symbol(lib_id, x, y, ref, value, fp, seed, dnp=False, pins=None,
+               show_fields=True, extra_props=()):
+    _, plist = sym_block(lib_id)
+    if pins is None:
+        pins = [q["number"] for q in plist]
+    s = '  (symbol (lib_id "%s") (at %.2f %.2f 0) (unit 1)\n' % (lib_id, x, y)
+    s += '    (in_bom %s) (on_board yes) (dnp %s)\n' % (
+        "yes" if not lib_id.startswith("power:") else "no",
+        "yes" if dnp else "no")
+    s += '    (uuid %s)\n' % _u("s" + seed)
+    hidden = lib_id.startswith("power:")
+    s += ('    (property "Reference" "%s" (at %.2f %.2f 0)\n'
+          '      (effects (font (size 1.27 1.27)) (justify left)%s)\n    )\n'
+          % (ref, x + 2.2, y - 2.2, " hide" if hidden else ""))
+    s += ('    (property "Value" "%s" (at %.2f %.2f 0)\n'
+          '      (effects (font (size 1.27 1.27)) (justify left)%s)\n    )\n'
+          % (value, x + 2.2, y + 0.6,
+             "" if show_fields else " hide"))
+    if fp is not None:
+        s += ('    (property "Footprint" "%s" (at %.2f %.2f 0)\n'
+              '      (effects (font (size 1.27 1.27)) hide)\n    )\n'
+              % (fp, x, y))
+    s += ('    (property "Datasheet" "" (at %.2f %.2f 0)\n'
+          '      (effects (font (size 1.27 1.27)) hide)\n    )\n' % (x, y))
+    for k, v in extra_props:
+        s += ('    (property "%s" "%s" (at %.2f %.2f 0)\n'
+              '      (effects (font (size 1.27 1.27)) hide)\n    )\n'
+              % (k, v, x, y))
+    for pn in pins:
+        s += '    (pin "%s" (uuid %s))\n' % (pn, _u("p" + seed + pn))
+    s += ('    (instances (project "%s" (path "/%s"\n'
+          '      (reference "%s") (unit 1)\n    )))\n  )\n'
+          % (NAME, SHEET_UUID, ref))
+    SCH.append(s)
+
+
+def sch_text(x, y, txt, size=2.0, seed=""):
+    SCH.append('  (text "%s" (at %.2f %.2f 0)\n'
+               '    (effects (font (size %.2f %.2f) bold) (justify left bottom))\n'
+               '    (uuid %s)\n  )\n' % (txt, x, y, size, size,
+                                         _u("t" + seed + txt)))
+
+
+def sch_box(x0, y0, x1, y1, seed):
+    SCH.append('  (rectangle (start %.2f %.2f) (end %.2f %.2f)\n'
+               '    (stroke (width 0.2) (type dash)) (fill (type none))\n'
+               '    (uuid %s)\n  )\n' % (x0, y0, x1, y1, _u("r" + seed)))
+
+
+PWR_N = [0]
+
+
+def attach(px, py, d, net, seed):
+    """From a pin endpoint, draw the stub and terminate it: a power symbol for
+    GND/+3V3, a plain label otherwise.
+
+    Rails that need the stub to turn a corner (the header's, which leave
+    sideways) run out to their own lane first -- 5.08 mm for GND, 7.62 mm for
+    +3V3 -- so a turning stub can never land on the neighbouring pin's stub,
+    which is 2.54 mm long.  That bug silently shorted RESET_N to +3V3 on the
+    first pass, so the lane separation is load-bearing, not cosmetic."""
+    reach = 2.54
+    if net == "GND" and d != (0, 1):
+        reach = 5.08
+    elif net == "+3V3" and d != (0, -1):
+        reach = 7.62
+    ax, ay = px + d[0] * reach, py + d[1] * reach
+    w((px, py), (ax, ay), seed)
+    if net == "GND":
+        if d != (0, 1):
+            w((ax, ay), (ax, ay + 2.54), seed + "g")
+            ay += 2.54
+        PWR_N[0] += 1
+        sch_symbol("power:GND", ax, ay, "#PWR%03d" % PWR_N[0], "GND", None,
+                   seed + "G", show_fields=False)
+    elif net == "+3V3":
+        if d != (0, -1):
+            w((ax, ay), (ax, ay - 2.54), seed + "v")
+            ay -= 2.54
+        PWR_N[0] += 1
+        sch_symbol("power:+3V3", ax, ay, "#PWR%03d" % PWR_N[0], "+3V3", None,
+                   seed + "V", show_fields=False)
+    else:
+        lbl(ax, ay, net, d, seed)
+
+
+def write_schematic():
+    del SCH[:]
+    PWR_N[0] = 0
+    used = sorted({p["lib_id"] for p in P} |
+                  {"power:GND", "power:+3V3", "power:PWR_FLAG"})
+
+    for p in P:
+        X, Y = p["sch"]
+        sch_symbol(p["lib_id"], X, Y, p["ref"], p["value"], p["fp"],
+                   p["ref"], dnp=p["dnp"],
+                   extra_props=(("Description", p["descr"]),
+                                ("LCSC", p["lcsc"])) if p["lcsc"] else
+                               (("Description", p["descr"]),))
+        for pin, net in sorted(p["nets"].items()):
+            px, py, d = sch_pin_pos(p, pin)
+            seed = "%s.%s" % (p["ref"], pin)
+            if net is None:
+                nc(px, py, seed)
+            else:
+                attach(px, py, d, net, seed)
+
+    # PWR_FLAGs.  These nets are fed from passive pins only (the header, or a
+    # 0 ohm bead), so ERC has to be told they are supplies.
+    fx, fy = snap(40.0), snap(250.0)
+    for net in PWR_FLAG_NETS:
+        PWR_N[0] += 1
+        sch_symbol("power:PWR_FLAG", fx, fy, "#FLG%03d" % PWR_N[0],
+                   "PWR_FLAG", None, "FLG" + net, show_fields=False)
+        # Both a PWR_FLAG pin and a rail symbol pin leave their origin
+        # vertically, so the link between them is drawn horizontally: that
+        # keeps each symbol's own graphic clear of the wire, which a vertical
+        # link does not, and a doubled-back vertical wire left the +3V3 flag
+        # unconnected on the first pass.
+        w((fx, fy), (fx + 5.08, fy), "flg" + net)
+        if net in ("GND", "+3V3"):
+            PWR_N[0] += 1
+            sch_symbol("power:" + net, fx + 5.08, fy,
+                       "#PWR%03d" % PWR_N[0], net, None, "flgp" + net,
+                       show_fields=False)
+        else:
+            lbl(fx + 5.08, fy, net, (1, 0), "flgl" + net)
+        fx += snap(30.0)
+
+    sch_text(30, 25, "T1S HAT for LilyGO T-ETH-Elite  -  Microchip LAN8651 "
+                     "10BASE-T1S MAC-PHY", 3.5, "title")
+    sch_text(30, 33, "Every value is from ELECTRICAL.md (Microchip "
+                     "DS60001734F / AN1718 DS60001718D). Single 3.3 V rail: "
+                     "the LAN8651 regulates its own 1.8 V core.", 1.8, "sub")
+    sch_text(30, 62, "SUPPLY + DECOUPLING   0.1uF and 0.01uF at EVERY power "
+                     "pin, 0.01uF nearest.  FB1..3 are the data sheet's "
+                     "optional supply-island beads, fitted as 0R.", 1.8, "g1")
+    sch_text(255, 85, "BUS INTERFACE NETWORK (AN1718 MINIMAL BIN)   "
+                      "CMC - AC coupling - termination - ESD - MDI connector",
+             1.8, "g2")
+    sch_text(255, 160, "R1/R2 SHIP UNSTUFFED.  Fit 49R9 1% 1W for an "
+                       "END-OF-BUS node, or 1K5 1% for an interior DROP node.",
+             1.8, "g3")
+    sch_text(120, 228, "CLOCK  25.000 MHz, CL 18 pF.  No series and no "
+                       "feedback resistor: the device has ~1 Mohm internally "
+                       "across the amplifier.", 1.8, "g4")
+    sch_text(255, 228, "STATUS LEDs on DIOA0/DIOA1 (VDDP domain, 1k to 3V3; "
+                       "the DIO sinks).  DIOA2/3/4 and DIOB0/DIOB1 to ground.",
+             1.8, "g5")
+    sch_text(30, 248, "PWR_FLAG: these rails are fed through passive pins "
+                      "(header pads, 0R beads), so ERC is told where the "
+                      "supply enters.", 1.8, "g6")
+    sch_box(28, 36, 330, 70, "bx1")
+    sch_box(250, 86, 470, 165, "bx2")
+    sch_box(115, 180, 235, 232, "bx3")
+    sch_box(250, 180, 345, 232, "bx4")
+
+    out = '(kicad_sch (version 20230121) (generator eeschema)\n'
+    out += '  (uuid %s)\n' % SHEET_UUID
+    out += '  (paper "A2")\n'
+    out += ('  (title_block\n    (title "T1S HAT - LAN8651 10BASE-T1S")\n'
+            '    (date "")\n    (rev "A")\n'
+            '    (company "")\n'
+            '    (comment 1 "Generated by make_t1s_hat.py from ELECTRICAL.md")\n'
+            '  )\n')
+    out += '  (lib_symbols\n'
+    for lid in used:
+        out += lib_symbol_for_sch(lid) + "\n"
+    out += '  )\n'
+    out += "".join(SCH)
+    out += '  (sheet_instances\n    (path "/" (page "1"))\n  )\n)\n'
+    with open(SCH_PATH, "w") as f:
+        f.write(out)
+    print("wrote %s (%d symbols)" % (SCH_PATH, len(P)))
+
+
+# ===========================================================================
+#  PROJECT + LIBRARY TABLES
+# ===========================================================================
+# Net classes.  DIRECTED: the board is 2-layer, so the T1S pair is a
+# microstrip over the solid B.Cu pour (1.51 mm of FR4).  It is NOT 50 ohm on
+# that stack and is not claimed to be; see README.  The pair still gets its
+# own class so its width, clearance and the AN1718 3x-trace-width spacing rule
+# are enforced by DRC rather than by hand.
+T1S_NETS = ["TRXP", "TRXN", "CMC_P", "CMC_N", "BUS_P", "BUS_N"]
+NETCLASSES = [
+    dict(name="Default", clearance=0.15, track_width=0.25,
+         via_diameter=0.60, via_drill=0.30),
+    dict(name="Power", clearance=0.15, track_width=0.45,
+         via_diameter=0.70, via_drill=0.35,
+         nets=["+3V3", "GND", "VDDP", "VDDA", "VDDAU"]),
+    dict(name="T1S", clearance=0.15, track_width=0.35,
+         via_diameter=0.60, via_drill=0.30, nets=T1S_NETS),
+]
+
+
+def write_project():
+    classes = []
+    assign = []
+    for nc_ in NETCLASSES:
+        classes.append({
+            "bus_width": 12, "clearance": nc_["clearance"],
+            "diff_pair_gap": 0.25, "diff_pair_via_gap": 0.25,
+            "diff_pair_width": 0.2, "line_style": 0,
+            "microvia_diameter": 0.3, "microvia_drill": 0.1,
+            "name": nc_["name"], "pcb_color": "rgba(0, 0, 0, 0.000)",
+            "schematic_color": "rgba(0, 0, 0, 0.000)",
+            "track_width": nc_["track_width"],
+            "via_diameter": nc_["via_diameter"], "via_drill": nc_["via_drill"],
+            "wire_width": 6,
+        })
+        for n in nc_.get("nets", []):
+            assign.append([n if n in ("+3V3", "GND") else "/" + n,
+                           nc_["name"]])
+    pro = {
+        "board": {"design_settings": {"defaults": {}}},
+        "boards": [],
+        "cvpcb": {"equivalence_files": []},
+        "libraries": {"pinned_footprint_libs": [], "pinned_symbol_libs": []},
+        "meta": {"filename": NAME + ".kicad_pro", "version": 1},
+        "net_settings": {
+            "classes": classes,
+            "meta": {"version": 3},
+            "net_colors": None,
+            "netclass_assignments": dict(assign),
+            "netclass_patterns": [],
+        },
+        "pcbnew": {"last_paths": {}, "page_layout_descr_file": ""},
+        "schematic": {"legacy_lib_dir": "", "legacy_lib_list": []},
+        "sheets": [[SHEET_UUID, ""]],
+        "text_variables": {},
+    }
+    with open(PRO_PATH, "w") as f:
+        json.dump(pro, f, indent=2)
+        f.write("\n")
+    print("wrote %s" % PRO_PATH)
+
+
+def write_lib_tables():
+    with open(os.path.join(HERE, "sym-lib-table"), "w") as f:
+        f.write('(sym_lib_table\n  (version 7)\n'
+                '  (lib (name "t1s_hat")(type "KiCad")'
+                '(uri "${KIPRJMOD}/sym/t1s_hat.kicad_sym")'
+                '(options "")(descr "Parts created for this board"))\n)\n')
+    with open(os.path.join(HERE, "fp-lib-table"), "w") as f:
+        f.write('(fp_lib_table\n  (version 7)\n)\n')
+    print("wrote sym-lib-table, fp-lib-table")
+
+
+# ===========================================================================
+#  PCB
+# ===========================================================================
+HDR_LIB = KFP + "Connector_PinHeader_2.54mm.pretty"
+HDR_FP = "PinHeader_2x20_P2.54mm_Vertical"
+
+NETS = {}          # name -> NETINFO_ITEM
+PADPOS = {}        # (ref, padnum) -> (gx, gy)
+
+
+def add_seg(board, layer, p0, p1, width):
+    s = pcbnew.PCB_SHAPE(board)
+    s.SetShape(pcbnew.SHAPE_T_SEGMENT)
+    s.SetStart(V(*p0))
+    s.SetEnd(V(*p1))
+    s.SetLayer(layer)
+    s.SetWidth(MM(width))
+    board.Add(s)
+    return s
+
+
+def add_arc(board, layer, p0, pmid, p1, width):
+    s = pcbnew.PCB_SHAPE(board)
+    s.SetShape(pcbnew.SHAPE_T_ARC)
+    s.SetArcGeometry(V(*p0), V(*pmid), V(*p1))
+    s.SetLayer(layer)
+    s.SetWidth(MM(width))
+    board.Add(s)
+    return s
+
+
+def add_text(board, txt, gx, gy, h=1.0, w=None, th=0.15, angle=0,
+             layer=None, just="center", mirror=False):
+    if w is None:
+        w = h * 0.82
+    if layer is None:
+        layer = pcbnew.F_SilkS
+    t = pcbnew.PCB_TEXT(board)
+    t.SetText(txt)
+    t.SetLayer(layer)
+    t.SetPosition(V(gx, gy))
+    t.SetTextSize(SZ(w, h))
+    t.SetTextThickness(MM(th))
+    t.SetTextAngle(pcbnew.EDA_ANGLE(angle, pcbnew.DEGREES_T))
+    t.SetHorizJustify({"center": pcbnew.GR_TEXT_H_ALIGN_CENTER,
+                       "left": pcbnew.GR_TEXT_H_ALIGN_LEFT,
+                       "right": pcbnew.GR_TEXT_H_ALIGN_RIGHT}[just])
+    t.SetVertJustify(pcbnew.GR_TEXT_V_ALIGN_CENTER)
+    if mirror:
+        t.SetMirrored(True)
+    board.Add(t)
+    return t
+
+
+def add_npth(board, ref, gx, gy, diameter, descr):
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetFPID(pcbnew.LIB_ID("t1s_hat", "NPTH_%.2fmm" % diameter))
+    fp.SetReference(ref)
+    fp.SetValue("NPTH_%.2fmm" % diameter)
+    fp.SetDescription(descr)
+    fp.Reference().SetVisible(False)
+    fp.Value().SetVisible(False)
+    fp.SetAttributes(pcbnew.FP_EXCLUDE_FROM_POS_FILES |
+                     pcbnew.FP_EXCLUDE_FROM_BOM)
+    pad = pcbnew.PAD(fp)
+    pad.SetNumber("")
+    pad.SetAttribute(pcbnew.PAD_ATTRIB_NPTH)
+    pad.SetShape(pcbnew.PAD_SHAPE_CIRCLE)
+    pad.SetDrillShape(pcbnew.PAD_DRILL_SHAPE_CIRCLE)
+    pad.SetSize(SZ(diameter, diameter))
+    pad.SetDrillSize(SZ(diameter, diameter))
+    pad.SetLayerSet(pcbnew.PAD.UnplatedHoleMask())
+    fp.Add(pad)
+    board.Add(fp)
+    fp.SetPosition(V(gx, gy))
+    pad.SetPosition(V(gx, gy))
+    pad.SetPos0(pcbnew.VECTOR2I(0, 0))
+    return fp
+
+
+def draw_outline(board):
+    """Plain rectangle, 3 mm rounded corners.  DIRECTED: no RJ45 notch -- a
+    taller riser lifts this board over the jack instead of cutting round it,
+    which also leaves the B.Cu ground pour uninterrupted."""
+    L, R, B, T = 0.0, BOARD_W, 0.0, BOARD_H
+    r = CORNER_R
+    d = r * (1 - 0.70710678)
+    add_seg(board, pcbnew.Edge_Cuts, (L + r, B), (R - r, B), EDGE_W)
+    add_arc(board, pcbnew.Edge_Cuts, (R - r, B), (R - d, B + d), (R, B + r),
+            EDGE_W)
+    add_seg(board, pcbnew.Edge_Cuts, (R, B + r), (R, T - r), EDGE_W)
+    add_arc(board, pcbnew.Edge_Cuts, (R, T - r), (R - d, T - d), (R - r, T),
+            EDGE_W)
+    add_seg(board, pcbnew.Edge_Cuts, (R - r, T), (L + r, T), EDGE_W)
+    add_arc(board, pcbnew.Edge_Cuts, (L + r, T), (L + d, T - d), (L, T - r),
+            EDGE_W)
+    add_seg(board, pcbnew.Edge_Cuts, (L, T - r), (L, B + r), EDGE_W)
+    add_arc(board, pcbnew.Edge_Cuts, (L, B + r), (L + d, B + d), (L + r, B),
+            EDGE_W)
+
+
+def net(board, name):
+    if name not in NETS:
+        n = pcbnew.NETINFO_ITEM(board, name)
+        board.Add(n)
+        NETS[name] = n
+    return NETS[name]
+
+
+def place_header(board):
+    """2x20 THT socket, pads on GEOMETRY.md's grid.  Orientation is chosen by
+    measuring the resulting pad vectors, exactly as ../pcb/make_board.py does,
+    rather than by trusting a sign convention."""
+    want_p3 = (MM(HDR_PITCH), 0)
+    want_p2 = (0, -MM(HDR_PITCH))
+    tol = MM(0.001)
+    chosen = None
+    for deg in (0, 90, 180, 270):
+        fp = pcbnew.FootprintLoad(HDR_LIB, HDR_FP)
+        fp.SetPosition(pcbnew.VECTOR2I(0, 0))
+        fp.SetOrientation(pcbnew.EDA_ANGLE(deg, pcbnew.DEGREES_T))
+        p = {pad.GetNumber(): pad.GetPosition() for pad in fp.Pads()}
+        d3 = (p["3"].x - p["1"].x, p["3"].y - p["1"].y)
+        d2 = (p["2"].x - p["1"].x, p["2"].y - p["1"].y)
+        if (abs(d3[0] - want_p3[0]) < tol and abs(d3[1] - want_p3[1]) < tol and
+                abs(d2[0] - want_p2[0]) < tol and
+                abs(d2[1] - want_p2[1]) < tol):
+            chosen = deg
+            break
+    if chosen is None:
+        raise RuntimeError("no 90 deg orientation gives the required grid")
+    print("  J1 orientation %d deg gives GEOMETRY.md's pad grid" % chosen)
+
+    fp = pcbnew.FootprintLoad(HDR_LIB, HDR_FP)
+    fp.SetOrientation(pcbnew.EDA_ANGLE(chosen, pcbnew.DEGREES_T))
+    fp.SetFPID(pcbnew.LIB_ID("Connector_PinHeader_2.54mm", HDR_FP))
+    fp.SetReference("J1")
+    fp.SetValue(BY_REF["J1"]["value"])
+    fp.Value().SetVisible(False)
+    fp.Reference().SetPosition(V(59.0, 8.6))
+    fp.Reference().SetTextSize(SZ(0.85, 1.0))
+    fp.Reference().SetTextThickness(MM(0.15))
+    fp.Reference().SetTextAngle(pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T))
+    fp.SetAttributes(pcbnew.FP_THROUGH_HOLE)
+    board.Add(fp)
+    pads = {p.GetNumber(): p for p in fp.Pads()}
+    target = V(*pin_xy(1))
+    cur = pads["1"].GetPosition()
+    pos = fp.GetPosition()
+    fp.SetPosition(pcbnew.VECTOR2I(pos.x + (target.x - cur.x),
+                                   pos.y + (target.y - cur.y)))
+    for num, pad in pads.items():
+        n = HDR_NET[int(num)]
+        if n:
+            pad.SetNet(net(board, n))
+    return fp
+
+
+def place_part(board, p):
+    lib, fpn = p["fp"].split(":", 1)
+    fp = pcbnew.FootprintLoad(KFP + lib + ".pretty", fpn)
+    if fp is None:
+        raise RuntimeError("footprint %s not found" % p["fp"])
+    fp.SetFPID(pcbnew.LIB_ID(lib, fpn))
+    fp.SetReference(p["ref"])
+    fp.SetValue(p["value"])
+    fp.Value().SetVisible(False)
+    # NOTE: do not SetDescription() here.  KiCad 7's lib_footprint_mismatch
+    # test compares the description against the library copy, so setting it
+    # raises a warning on every part.  The descriptions live in bom.csv.
+    fp.Reference().SetTextSize(SZ(0.70, 0.80))
+    fp.Reference().SetTextThickness(MM(0.12))
+    if p["dnp"] and hasattr(pcbnew, "FP_DNP"):
+        fp.SetAttributes(fp.GetAttributes() | pcbnew.FP_DNP)
+    board.Add(fp)
+    fp.SetOrientation(pcbnew.EDA_ANGLE(p["pcb"][2], pcbnew.DEGREES_T))
+    fp.SetPosition(V(p["pcb"][0], p["pcb"][1]))
+    for pad in fp.Pads():
+        num = pad.GetNumber()
+        try:
+            key = int(num)
+        except ValueError:
+            continue
+        n = p["nets"].get(key)
+        if n:
+            pad.SetNet(net(board, n))
+    return fp
+
+
+PADNET = {}
+
+
+def index_pads(board):
+    PADPOS.clear()
+    PADNET.clear()
+    for fp in board.GetFootprints():
+        for pad in fp.Pads():
+            k = (fp.GetReference(), pad.GetNumber())
+            PADPOS[k] = gof(pad.GetPosition())
+            nn = pad.GetNetname()
+            PADNET[k] = nn if nn else None
+
+
+def pt(spec):
+    """Route waypoint: ('REF', 'pad') or (x, y)."""
+    if isinstance(spec[0], str):
+        return PADPOS[(spec[0], str(spec[1]))]
+    return (float(spec[0]), float(spec[1]))
+
+
+def route(board, netname, width, waypoints, layer=None):
+    if layer is None:
+        layer = pcbnew.F_Cu
+    n = net(board, netname)
+    for spec in waypoints:
+        if isinstance(spec[0], str):
+            have = PADNET.get((spec[0], str(spec[1])))
+            if have != netname:
+                raise RuntimeError(
+                    "route on %s touches pad %s.%s which is on %s"
+                    % (netname, spec[0], spec[1], have))
+    pts = [pt(s) for s in waypoints]
+    for a, b in zip(pts, pts[1:]):
+        if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9:
+            continue
+        t = pcbnew.PCB_TRACK(board)
+        t.SetStart(V(*a))
+        t.SetEnd(V(*b))
+        t.SetWidth(MM(width))
+        t.SetLayer(layer)
+        t.SetNet(n)
+        board.Add(t)
+
+
+def via(board, netname, gx, gy, dia=0.6, drill=0.3):
+    v = pcbnew.PCB_VIA(board)
+    v.SetPosition(V(gx, gy))
+    v.SetWidth(MM(dia))
+    v.SetDrill(MM(drill))
+    v.SetViaType(pcbnew.VIATYPE_THROUGH)
+    v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    v.SetNet(net(board, netname))
+    board.Add(v)
+    return v
+
+
+def zone(board, netname, layers, poly, priority=0, rule_area=False,
+         no_pour=True, no_tracks=False, no_vias=False, no_pads=False,
+         no_fp=False, name=""):
+    z = pcbnew.ZONE(board)
+    ls = pcbnew.LSET()
+    for l in layers:
+        ls.addLayer(l)
+    z.SetLayerSet(ls)
+    # NOTE: build the outline with ZONE.AddPolygon, not SetOutline(poly_set).
+    # SetOutline takes ownership of the pointer while SWIG still frees the
+    # Python object, and the resulting double free crashes the zone filler and
+    # SaveBoard.  That cost an hour; do not "simplify" it back.
+    ch = pcbnew.SHAPE_LINE_CHAIN()
+    for gx, gy in poly:
+        ch.Append(V(gx, gy))
+    ch.SetClosed(True)
+    z.AddPolygon(ch)
+    z.SetZoneName(name)
+    if rule_area:
+        z.SetIsRuleArea(True)
+        z.SetDoNotAllowCopperPour(no_pour)
+        z.SetDoNotAllowTracks(no_tracks)
+        z.SetDoNotAllowVias(no_vias)
+        z.SetDoNotAllowPads(no_pads)
+        z.SetDoNotAllowFootprints(no_fp)
+    else:
+        z.SetNet(net(board, netname))
+        z.SetAssignedPriority(priority)
+        z.SetPadConnection(pcbnew.ZONE_CONNECTION_THERMAL)
+        z.SetLocalClearance(MM(0.20))
+        z.SetMinThickness(MM(0.15))
+        z.SetThermalReliefGap(MM(0.30))
+        z.SetThermalReliefSpokeWidth(MM(0.50))
+    board.Add(z)
+    return z
+
+
+def rect(x0, y0, x1, y1):
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+# ---------------------------------------------------------------------------
+# ROUTING.  Every net on this board is routed on F.Cu; B.Cu carries nothing
+# but the ground pour, which is the reference plane the T1S pair needs.
+# Widths: 0.35 for the T1S pair (its net class), 0.45 for supplies, 0.25 for
+# signals, 0.30 for short fan-out stubs at the QFN.
+# ---------------------------------------------------------------------------
+WT, WP, WS, WF = 0.35, 0.45, 0.25, 0.30
+WQ = 0.15          # neck width inside the QFN's 0.5 mm pitch
+
+ROUTES = []
+VIAS = []
+
+
+def build_routes():
+    """Waypoint lists in G-frame mm.  Pad references keep the copper glued to
+    the footprints, so moving a part moves its route with it, and route()
+    refuses any waypoint whose pad is on a different net."""
+    del ROUTES[:]
+    del VIAS[:]
+    R = ROUTES.append
+    G = VIAS.append
+
+    # ================= T1S pair, U1 -> CMC -> caps -> term -> CN1 =========
+    # Symmetric about x = 29.0 from the QFN all the way to the connector, so
+    # the two legs are the same length by construction.  No vias on either.
+    R(("TRXP", WQ, [("U1", "30"), (29.25, 24.75), (29.00, 25.00)]))
+    R(("TRXP", WT, [(29.00, 25.00), ("L1", "4")]))
+    R(("TRXN", WQ, [("U1", "31"), (28.75, 24.00), (28.00, 24.75)]))
+    R(("TRXN", WT, [(28.00, 24.75), ("L1", "1")]))
+    R(("CMC_P", WT, [("L1", "3"), (29.00, 29.10), (29.50, 29.60),
+                     ("C1", "1")]))
+    R(("CMC_N", WT, [("L1", "2"), (28.00, 29.10), (27.50, 29.60),
+                     ("C2", "1")]))
+    R(("BUS_P", WT, [("C1", "2"), (29.50, 32.80), (33.46, 32.80),
+                     (33.46, 38.40), (30.405, 38.40), ("CN1", "1")]))
+    R(("BUS_N", WT, [("C2", "2"), (27.50, 32.80), (23.54, 32.80),
+                     (23.54, 38.40), (26.595, 38.40), ("CN1", "2")]))
+    R(("BUS_P", WT, [(33.46, 37.00), ("MOV1", "1")]))
+    R(("BUS_N", WT, [(23.54, 37.00), ("MOV2", "1")]))
+    R(("BUS_CT", WS, [("R2", "2"), ("R1", "2")]))
+    R(("BUS_CT", WS, [(28.50, 34.20), (28.50, 37.00)]))
+    R(("BUS_CT", WS, [("C3", "1"), (28.50, 37.00), ("R3", "1")]))
+    # CN1 is P N N P: the N pair is adjacent, the P pair is bridged under the
+    # connector body, where nothing else runs.
+    R(("BUS_N", WT, [("CN1", "2"), ("CN1", "3")]))
+    R(("BUS_P", WT, [("CN1", "1"), (30.405, 44.00), (18.975, 44.00),
+                     ("CN1", "4")]))
+
+    # ================= QFN top edge, right-hand group =====================
+    # One lane per pin; each lane turns up further right than the lane above
+    # it, so no two cross.  Verified by construction, not by eye.
+    for nm, pin, lane, turn in (("VDDAU", "25", 22.90, 44.00),
+                                ("RBIAS", "26", 23.40, 41.00),
+                                ("XTI",   "27", 23.90, 38.60),
+                                ("XTO",   "28", 24.40, 35.65),
+                                ("VDDA",  "29", 24.90, 33.00)):
+        R((nm, WQ, [("U1", pin), (PADPOS[("U1", pin)][0], lane)]))
+        R((nm, WQ, [(PADPOS[("U1", pin)][0], lane), (turn, lane)]))
+    R(("VDDA", WP, [(33.00, 24.90), ("FB1", "2")]))
+    R(("VDDA", WF, [(33.00, 26.40), ("C12", "1")]))
+    R(("VDDA", WF, [(33.00, 28.00), ("C11", "1")]))
+    R(("XTO", WS, [(35.65, 24.40), ("Y1", "2"), ("C15", "1")]))
+    R(("XTI", WS, [(38.60, 23.90), (38.60, 26.60), ("Y1", "1"),
+                   ("C16", "1")]))
+    R(("RBIAS", WS, [(41.00, 23.40), ("R7", "1")]))
+    R(("VDDAU", WP, [(44.00, 22.90), ("FB2", "2")]))
+    R(("VDDAU", WF, [(44.00, 26.00), ("C14", "1")]))
+    R(("VDDAU", WF, [(44.00, 27.60), ("C13", "1")]))
+
+    # ================= QFN right edge =====================================
+    R(("VDDP", WF, [("U1", "17"), (33.40, 17.60), (47.566, 17.60),
+                    (47.566, 8.00)]))
+    R(("VDDP", WF, [(47.566, 8.00), (44.225, 8.00), ("C9", "1"),
+                    ("C10", "1")]))
+    R(("LED0_K", WS, [("U1", "18"), (43.213, 18.75), ("D1", "1")]))
+    R(("LED1_K", WS, [("U1", "19"), (42.00, 19.25), (42.00, 21.50),
+                      ("D2", "1")]))
+    R(("CCOMP", 0.15, [("U1", "21"), (34.625, 20.25), ("C5", "1")]))
+    R(("CCOMP", 0.15, [("C5", "1"), (34.625, 22.40), (38.550, 22.40),
+                     ("C4", "1")]))
+    # DIOA2/3/4 are unused and go straight to ground (data sheet); each gets
+    # its own stitching via rather than relying on the F.Cu flood reaching
+    # between 0.5 mm-pitch escapes, which it cannot.
+    R(("GND", WQ, [("U1", "20"), (36.90, 19.75), (36.90, 20.20)]))
+    R(("GND", WQ, [("U1", "22"), (33.30, 20.75)]))
+    G(("GND", 33.30, 20.75, 0.45, 0.25))
+    R(("GND", WQ, [("U1", "23"), (33.30, 21.25), (33.30, 21.75)]))
+    G(("GND", 33.30, 21.75, 0.45, 0.25))
+
+    # ================= QFN left edge ======================================
+    R(("VDDP", WF, [("U1", "4"), (19.626, 20.25)]))
+    R(("VDDP", WF, [("U1", "7"), (19.626, 18.75)]))
+    R(("VDDP", WP, [(19.626, 20.25), (19.626, 13.60)]))
+    R(("VDDP", WF, [(19.626, 13.60), (18.975, 13.60), ("FB3", "2")]))
+    R(("VDDP", WF, [(19.626, 18.75), (19.626, 16.00), ("C8", "1")]))
+    R(("VDDP", WF, [(19.626, 16.00), (19.626, 13.60), ("C7", "1")]))
+    R(("RESET_N", WS, [("U1", "8"), (24.706, 18.25), (24.706, 3.36),
+                       ("J1", "15")]))
+
+    # ================= QFN bottom edge: SPI down to the header ============
+    # Lanes fan out so that no two of the five cross; MOSI is the one signal
+    # whose source is right of its target, so it takes the long way round
+    # below the header instead of cutting through the others.
+    R(("IRQ_N", WS, [("U1", "9"), (28.25, 12.40), (25.976, 12.40),
+                     ("J1", "16")]))
+    R(("SPI_MISO", WS, [("U1", "10"), (28.75, 13.60), (32.326, 13.60),
+                        (32.326, 3.36), ("J1", "21")]))
+    R(("SPI_CS_N", WS, [("U1", "11"), (29.25, 14.40), (34.866, 14.40),
+                        (34.866, 5.90), ("J1", "24")]))
+    R(("SPI_SCLK", WS, [("U1", "12"), (29.75, 15.20), (37.406, 15.20),
+                        (37.406, 3.36), ("J1", "23")]))
+    R(("SPI_MOSI", WS, [("U1", "13"), (30.25, 16.00), (39.946, 16.00),
+                        (39.946, 1.35), (31.056, 1.35), ("J1", "19")]))
+
+    # ================= 3V3 distribution ===================================
+    # Both header 3V3 pins are picked up from below the odd row, where there
+    # is a clear 2 mm band, and the rail runs out to the right-hand parts up
+    # the one column that MOSI's return lane does not cross.
+    R(("+3V3", WP, [("J1", "1"), (8.196, 2.00), (28.516, 2.00),
+                    ("J1", "17")]))
+    R(("+3V3", WP, [(8.196, 2.00), (6.90, 2.00), (6.90, 10.50),
+                    (17.213, 10.50), ("FB3", "1")]))
+    R(("+3V3", 0.40, [(22.166, 2.00), (22.166, 15.00), ("R4", "1")]))
+    R(("+3V3", 0.40, [(13.50, 10.50), (13.50, 46.50), (52.646, 46.50),
+                      (52.646, 31.90), (44.00, 31.90), ("FB2", "1")]))
+    R(("+3V3", 0.40, [(52.646, 31.90), (52.646, 12.40)]))
+    R(("+3V3", WF, [(13.50, 18.00), ("C6", "1")]))
+    R(("+3V3", WP, [(44.00, 31.90), (33.00, 31.90), ("FB1", "1")]))
+    R(("+3V3", WF, [(52.646, 19.00), ("R8", "1")]))
+    R(("+3V3", WF, [(52.646, 21.50), ("R9", "1")]))
+    # R5 (CS_N pull-up) sits on the far side of MOSI's return column, so its
+    # 3V3 arrives from the right-hand rail and its CS_N leg reaches back to
+    # the CS_N column.  See README: this is the one crossing the single layer
+    # cannot absorb, and it is left as an explicit gap, not hidden.
+    R(("+3V3", WF, [(52.646, 12.40), ("R5", "1")]))
+    R(("LED0_A", WS, [("D1", "2"), ("R8", "2")]))
+    R(("LED1_A", WS, [("D2", "2"), ("R9", "2")]))
+    R(("RESET_N", WS, [("R4", "2"), (24.706, 14.00)]))
+    R(("IRQ_N", WS, [("R6", "2"), (28.25, 12.40)]))
+    R(("+3V3", WF, [("R6", "1"), (29.786, 12.40), (29.786, 2.00),
+                    (28.516, 2.00)]))
+
+    # ================= ground stitching ===================================
+    # Every GND pad that the F.Cu flood cannot reach gets its own via to the
+    # B.Cu plane.  Two vias would be better per the data sheet's decoupling
+    # rule; one is what the 2-layer flood geometry allows here.
+    for ent in [
+            ("U1", "32", 27.60, 23.20),
+            ("C3", "2", 25.15, 35.60), ("R3", "2", 31.812, 35.60),
+            ("MOV1", "2", 40.10, 37.00), ("MOV2", "2", 18.50, 37.00),
+            ("C15", "2", 35.65, 30.90), ("C16", "2", 38.15, 30.90),
+            ("R7", "2", 41.00, 28.70), ("C11", "2", 30.20, 28.00),
+            ("C12", "2", 30.20, 26.40), ("C13", "2", 49.10, 27.60),
+            ("C14", "2", 49.10, 26.00), ("C4", "2", 41.40, 20.55, 0.45, 0.25),
+            ("C5", "2", 36.90, 20.20), ("C6", "2", 17.90, 18.00),
+            ("C7", "2", 20.625, 12.40), ("C9", "2", 46.30, 9.50),
+            ("C10", "2", 40.70, 9.50), ("C8", "2", 22.10, 16.00)]:
+        ref, pad, gx, gy = ent[:4]
+        G(("GND", gx, gy) + tuple(ent[4:]) if len(ent) > 4
+          else ("GND", gx, gy, 0.60, 0.30))
+        R(("GND", WF, [(ref, pad), (gx, gy)]))
+    R(("GND", WF, [("U1", "32"), (28.00, 23.20), (27.60, 23.20)]))
+    R(("GND", 0.20, [("U1", "16"), (31.75, 16.70)]))
+    G(("GND", 31.75, 16.70, 0.45, 0.25))
+    R(("GND", WQ, [("U1", "5"), (25.40, 19.55)]))
+    G(("GND", 25.40, 19.55, 0.45, 0.25))
+
+
+# ---------------------------------------------------------------------------
+# ZONES AND RULE AREAS
+# ---------------------------------------------------------------------------
+# The BIN block, for AN1718 guideline 5: a void in the OUTER-layer ground
+# flood around the bus interface network, to keep trace capacitance down.
+# On a 2-layer board only F.Cu is voided -- B.Cu is the reference plane the
+# pair is routed over and must stay whole.
+BIN_VOID = (21.0, 23.4, 40.5, 39.8)
+# All-layer void under the common-mode choke (AN1718 guideline 6): this one
+# DOES cut B.Cu, and it is the only place other than the antenna window that
+# does.  Sized to the choke body, not its pads.
+CMC_VOID = (27.55, 24.35, 29.45, 28.85)
+
+
+def add_zones(board):
+    m = 0.30                                  # zone inset from the board edge
+    outline = [(m, m), (BOARD_W - m, m), (BOARD_W - m, BOARD_H - m),
+               (m, BOARD_H - m)]
+
+    # antenna keepout: no copper on ANY layer, and nothing placed there
+    x0, y0, x1, y1 = KEEPOUT
+    zone(board, None, [pcbnew.F_Cu, pcbnew.B_Cu], rect(x0, y0, x1, y1),
+         rule_area=True, no_pour=True, no_tracks=True, no_vias=True,
+         no_pads=True, no_fp=True, name="ANTENNA KEEPOUT")
+    # all-layer void under the CMC
+    zone(board, None, [pcbnew.F_Cu, pcbnew.B_Cu], rect(*CMC_VOID),
+         rule_area=True, no_pour=True, no_tracks=False, no_vias=True,
+         name="CMC ALL-LAYER VOID")
+    # outer-layer ground-flood void around the BIN (F.Cu only)
+    zone(board, None, [pcbnew.F_Cu], rect(*BIN_VOID),
+         rule_area=True, no_pour=True, name="BIN GROUND-FLOOD VOID")
+
+    # B.Cu: the ground plane.  One pour, whole board, nothing else on it.
+    zb = zone(board, "GND", [pcbnew.B_Cu], outline, priority=0,
+              name="GND plane (B.Cu)")
+    zb.SetPadConnection(pcbnew.ZONE_CONNECTION_FULL)
+    # the QFN exposed pad is a 3.4 mm land with nine thermal vias; thermal
+    # spokes starve it, so both ground pours take it solid.
+    # F.Cu: ground flood in what is left between the signals.
+    zf = zone(board, "GND", [pcbnew.F_Cu], outline, priority=0,
+         name="GND flood (F.Cu)")
+    zf.SetPadConnection(pcbnew.ZONE_CONNECTION_FULL)
+
+
+def draw_silk(board):
+    cx = BOARD_W / 2.0
+    add_text(board, "T1S HAT  LAN8651  10BASE-T1S", 41.0, 47.2,
+             h=1.5, w=1.2, th=0.24)
+    add_text(board, "for LilyGO T-ETH-Elite", 41.0, 45.2, h=1.0, th=0.16)
+
+    # bus connector legend -- the pad order is P N N P, so label every pin
+    for i, lab in enumerate(("P", "N", "N", "P")):
+        add_text(board, lab, 19.475 + 3.81 * i, 38.9, h=1.3, w=1.1, th=0.22)
+    add_text(board, "T1S BUS", 11.0, 41.0, h=1.4, w=1.2, th=0.22)
+    add_text(board, "1-2 and 3-4 are the same pair;", 11.0, 39.0, h=0.8,
+             th=0.13)
+    add_text(board, "wire P to P, N to N.", 11.0, 37.8, h=0.8, th=0.13)
+
+    # termination stuffing, the one thing an assembler must decide
+    for i, line in enumerate((
+            "R1 R2  TERMINATION - SHIPPED UNSTUFFED",
+            "END OF BUS ....... 49R9  1%  1W",
+            "INTERIOR DROP .... 1K5   1%",
+            "R3/C3 common mode: fitted")):
+        add_text(board, line, 8.0, 33.0 - 1.35 * i, h=0.9, w=0.75, th=0.14,
+                 just="left")
+
+    # antenna keepout, marked so nobody fills it in later
+    x0, y0, x1, y1 = KEEPOUT
+    for a, b in (((x0, y0), (x1, y0)), ((x0, y1), (x1, y1)),
+                 ((x0, y0), (x0, y1))):
+        add_seg(board, pcbnew.F_SilkS, a, b, SILK_W)
+    add_text(board, "ANTENNA", 62.0, 35.0, h=1.2, w=1.0, th=0.2, angle=90)
+    add_text(board, "KEEPOUT - NO COPPER", 60.2, 33.0, h=0.9, w=0.75,
+             th=0.14, angle=90)
+
+    # pin-1 markers
+    px1, _ = pin_xy(1)
+    add_seg(board, pcbnew.F_SilkS, (px1 - 0.9, 8.0), (px1 + 0.9, 8.0), SILK_W)
+    add_seg(board, pcbnew.F_SilkS, (px1 - 0.9, 8.0), (px1, 9.2), SILK_W)
+    add_seg(board, pcbnew.F_SilkS, (px1 + 0.9, 8.0), (px1, 9.2), SILK_W)
+    add_text(board, "J1 PIN 1", 13.6, 8.6, h=0.9, th=0.14, just="left")
+
+    add_text(board, "LED0 DIOA0", 51.5, 23.5, h=0.8, w=0.7, th=0.13,
+             just="left")
+    add_text(board, "LED1 DIOA1", 51.5, 25.5, h=0.8, w=0.7, th=0.13,
+             just="left")
+
+    # back side: which way up
+    add_text(board, "T-ETH-ELITE SIDE", 33.0, 25.0, h=2.0, th=0.32,
+             layer=pcbnew.B_SilkS, mirror=True)
+    add_text(board, "socket faces down - use a 2x20 riser, "
+                    "not one tall stacking header", 33.0, 22.0, h=1.0,
+             th=0.16, layer=pcbnew.B_SilkS, mirror=True)
+
+
+# ---------------------------------------------------------------------------
+# BUILD
+# ---------------------------------------------------------------------------
+def build_pcb():
+    NETS.clear()
+    board = pcbnew.CreateEmptyBoard()
+    board.SetCopperLayerCount(2)          # DIRECTED: 2-layer, see README
+    bds = board.GetDesignSettings()
+    bds.SetBoardThickness(MM(BOARD_T))
+    bds.SetAuxOrigin(V(0.0, 0.0))
+    try:
+        bds.m_CopperEdgeClearance = MM(0.30)
+        bds.m_MinThroughDrill = MM(0.20)      # the QFN EP thermal vias
+        bds.m_HoleClearance = MM(0.20)
+        bds.m_HoleToHoleMin = MM(0.25)
+        bds.m_MinClearance = MM(0.13)
+        bds.m_ViasMinSize = MM(0.45)
+        bds.m_TrackMinWidth = MM(0.15)
+        bds.m_TrackMinWidth = MM(0.15)
+        bds.m_SilkClearance = MM(0.10)
+    except Exception as e:
+        print("  note: some design constraints not settable:", e)
+    board.SetLayerName(pcbnew.B_Cu, "B.Cu")
+
+    draw_outline(board)
+    for ref, gx, gy, descr in HOLES:
+        add_npth(board, ref, gx, gy, HOLE_D, descr)
+    place_header(board)
+    for p in P:
+        if p["ref"] == "J1":
+            continue
+        place_part(board, p)
+    index_pads(board)
+
+    build_routes()
+    for netname, width, wps in ROUTES:
+        route(board, netname, width, wps)
+    for v in VIAS:
+        via(board, v[0], v[1], v[2], *(v[3:] if len(v) > 3 else ()))
+
+    add_zones(board)
+    draw_silk(board)
+    pcbnew.SaveBoard(PCB_PATH, board)
+    inject_stackup()
+    print("wrote %s (zones not yet filled)" % PCB_PATH)
+    fill_zones_gui()
+    return pcbnew.LoadBoard(PCB_PATH)
+
+
+def fill_zones_gui():
+    """Fill the zones.
+
+    pcbnew's ZONE_FILLER segfaults when called from these Python bindings
+    (KiCad 7.0.11, headless), so the fill is done by the real pcbnew on an
+    Xvfb display: "Fill All Zones" (B), then save.  Same engine the GUI user
+    gets; the board file on disk afterwards carries real filled polygons, not
+    an empty <polygon> stub."""
+    subprocess.run(["sh", os.path.join(HERE, "fill_zones.sh")], check=True)
+    s = open(PCB_PATH).read()
+    if s.count("(filled_polygon") < 2:
+        raise RuntimeError("zone fill did not produce filled polygons")
+    print("zones filled (%d filled_polygon blocks)"
+          % s.count("(filled_polygon"))
+
+
+STACKUP = """    (stackup
+      (layer "F.SilkS" (type "Top Silk Screen"))
+      (layer "F.Paste" (type "Top Solder Paste"))
+      (layer "F.Mask" (type "Top Solder Mask") (thickness 0.01))
+      (layer "F.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 1" (type "core") (thickness 1.51) (material "FR4")\
+ (epsilon_r 4.5) (loss_tangent 0.02))
+      (layer "B.Cu" (type "copper") (thickness 0.035))
+      (layer "B.Mask" (type "Bottom Solder Mask") (thickness 0.01))
+      (layer "B.Paste" (type "Bottom Solder Paste"))
+      (layer "B.SilkS" (type "Bottom Silk Screen"))
+      (copper_finish "HASL lead free")
+      (dielectric_constraints no)
+    )
+"""
+
+
+def inject_stackup():
+    """KiCad 7's Python bindings do not expose the stackup editor, so the
+    stack is written into the board file directly: JLCPCB's standard 2-layer
+    1.6 mm FR4 build, 1 oz outer copper, 1.51 mm core."""
+    s = open(PCB_PATH).read()
+    if "(stackup" in s:
+        return
+    i = s.find("  (setup\n")
+    if i < 0:
+        raise RuntimeError("no (setup block in the board file")
+    j = i + len("  (setup\n")
+    open(PCB_PATH, "w").write(s[:j] + STACKUP + s[j:])
+
+
+# ===========================================================================
+#  VERIFY / DRC / EXPORT
+# ===========================================================================
+def verify(board):
+    """Read the saved board back and compare every mechanical feature against
+    GEOMETRY.md.  Fails loudly; the generator gets fixed, not this."""
+    tol = 0.01
+    rows, worst, ok = [], 0.0, True
+
+    def row(ref, spec, got, d):
+        nonlocal worst, ok
+        e = max(abs(x) for x in d)
+        worst = max(worst, e)
+        good = e <= tol
+        ok = ok and good
+        rows.append((ref, spec, got,
+                     " ".join("%+.4f" % x for x in d), "OK" if good else "FAIL"))
+
+    xs, ys = [], []
+    for dr in board.GetDrawings():
+        if dr.GetLayer() == pcbnew.Edge_Cuts:
+            for p in (dr.GetStart(), dr.GetEnd()):
+                g = gof(p)
+                xs.append(g[0])
+                ys.append(g[1])
+    row("outline", "0.000..%.3f x 0.000..%.3f" % (BOARD_W, BOARD_H),
+        "%.3f..%.3f x %.3f..%.3f" % (min(xs), max(xs), min(ys), max(ys)),
+        (min(xs), min(ys), max(xs) - BOARD_W, max(ys) - BOARD_H))
+
+    holes = {}
+    for fp in board.GetFootprints():
+        if re.fullmatch(r"H\d", fp.GetReference()):
+            pad = list(fp.Pads())[0]
+            g = gof(pad.GetPosition())
+            holes[fp.GetReference()] = (g[0], g[1],
+                                        pcbnew.ToMM(pad.GetDrillSize().x))
+    for ref, sx, sy, _d in HOLES:
+        ax, ay, ad = holes[ref]
+        row(ref, "%.3f, %.3f  D%.2f" % (sx, sy, HOLE_D),
+            "%.3f, %.3f  D%.2f" % (ax, ay, ad),
+            (ax - sx, ay - sy, ad - HOLE_D))
+
+    j1 = [f for f in board.GetFootprints() if f.GetReference() == "J1"][0]
+    pads = {p.GetNumber(): p for p in j1.Pads()}
+    for pin in range(1, 41):
+        sx, sy = pin_xy(pin)
+        ax, ay = gof(pads[str(pin)].GetPosition())
+        row("J1.%d" % pin, "%.3f, %.3f" % (sx, sy),
+            "%.3f, %.3f" % (ax, ay), (ax - sx, ay - sy))
+
+    # antenna keepout: nothing at all inside it, on any layer
+    x0, y0, x1, y1 = KEEPOUT
+    intruders = []
+    for t in board.GetTracks():
+        for p in ((t.GetStart(),) if t.Type() == pcbnew.PCB_VIA_T
+                  else (t.GetStart(), t.GetEnd())):
+            g = gof(p)
+            if x0 <= g[0] <= x1 and y0 <= g[1] <= y1:
+                intruders.append("track/via at %.2f,%.2f" % g)
+    for fp in board.GetFootprints():
+        g = gof(fp.GetPosition())
+        if x0 <= g[0] <= x1 and y0 <= g[1] <= y1:
+            intruders.append("footprint %s" % fp.GetReference())
+    for z in board.Zones():
+        if z.GetIsRuleArea():
+            continue
+        for lay in (pcbnew.F_Cu, pcbnew.B_Cu):
+            if not z.IsOnLayer(lay):
+                continue
+            poly = z.GetFilledPolysList(lay)
+            for i in range(poly.OutlineCount()):
+                oc = poly.Outline(i)
+                for k in range(oc.PointCount()):
+                    g = gof(oc.CPoint(k))
+                    if x0 + 0.01 <= g[0] <= x1 - 0.01 and \
+                            y0 + 0.01 <= g[1] <= y1 - 0.01:
+                        intruders.append(
+                            "%s copper at %.2f,%.2f on %s"
+                            % (z.GetNetname(), g[0], g[1],
+                               board.GetLayerName(lay)))
+                        break
+    row("keepout", "x %.2f..%.2f y %.2f..%.2f empty" % KEEPOUT,
+        "%d intruders" % len(intruders), (float(len(intruders)),))
+    for s in intruders[:8]:
+        print("    keepout intruder:", s)
+
+    # B.Cu must carry the ground pour and nothing else
+    bcu_tracks = [t for t in board.GetTracks()
+                  if t.Type() != pcbnew.PCB_VIA_T and
+                  t.GetLayer() == pcbnew.B_Cu]
+    row("B.Cu signals", "0 tracks", "%d tracks" % len(bcu_tracks),
+        (float(len(bcu_tracks)),))
+
+    w = [max(len(str(r[i])) for r in rows) for i in range(5)]
+    hdr = ("feature", "spec (mm)", "in .kicad_pcb (mm)", "delta", "")
+    w = [max(w[i], len(hdr[i])) for i in range(5)]
+    line = "  ".join("-" * x for x in w)
+    print(line)
+    print("  ".join(hdr[i].ljust(w[i]) for i in range(5)))
+    print(line)
+    for r in rows:
+        print("  ".join(str(r[i]).ljust(w[i]) for i in range(5)))
+    print(line)
+    print("worst error: %.5f mm   tolerance: %.3f mm   %s"
+          % (worst, tol, "ALL OK" if ok else "FAILURES PRESENT"))
+    return ok
+
+
+def unrouted(board):
+    """Count ratsnest connections still missing.  KiCad's own number, plus the
+    pads the DRC engine names, so the figure can be checked against drc.rpt."""
+    board.BuildConnectivity()
+    n = board.GetConnectivity().GetUnconnectedCount(True)
+    print("UNROUTED CONNECTIONS (ratsnest): %d" % n)
+    return n
+
+
+def run_drc(board):
+    """kicad-cli 7.0.11 has no `pcb drc`; call the same engine through the
+    bindings.  Nothing is excluded and nothing is filtered."""
+    os.environ.setdefault("KICAD7_FOOTPRINT_DIR", KFP)
+    rpt = os.path.join(HERE, "drc.rpt")
+    units = getattr(pcbnew, "EDA_UNITS_MILLIMETRES",
+                    getattr(pcbnew, "EDA_UNITS_MM", 1))
+    okay = pcbnew.WriteDRCReport(board, rpt, units, True)
+    print("WriteDRCReport -> %s (%s)" % (okay, rpt))
+    txt = open(rpt).read()
+    tail = [l for l in txt.splitlines() if l.startswith("**")]
+    print("\n".join(tail))
+    return txt
+
+
+# ===========================================================================
+#  BOM / CPL / GERBERS / PREVIEWS
+# ===========================================================================
+def write_bom():
+    """One line per distinct value+footprint, JLCPCB column order."""
+    groups = {}
+    for p in P:
+        key = (p["value"], p["fp"], p["dnp"], p["descr"], p["lcsc"])
+        groups.setdefault(key, []).append(p["ref"])
+    rows = []
+    for (value, fp, dnp, descr, lcsc), refs in groups.items():
+        refs = sorted(refs, key=lambda r: (re.sub(r"\d", "", r),
+                                           int(re.sub(r"\D", "", r) or 0)))
+        rows.append([value + (" [DNP]" if dnp else ""), ",".join(refs),
+                     fp, len(refs), "DNP" if dnp else "fit", descr, lcsc])
+    rows.sort(key=lambda r: r[1])
+    with open(os.path.join(HERE, "bom.csv"), "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["Comment", "Designator", "Footprint", "Quantity",
+                     "Populate", "Description", "LCSC"])
+        wr.writerows(rows)
+    print("wrote bom.csv (%d lines, %d parts, %d DNP)"
+          % (len(rows), len(P), sum(1 for p in P if p["dnp"])))
+
+
+def export_all():
+    """kicad-cli exports, all plotted against the drill/place origin, which
+    build_pcb() put on GEOMETRY.md's own origin -- so the drill files and
+    cpl.csv read directly in GEOMETRY.md coordinates."""
+    gerb = os.path.join(HERE, "gerbers")
+    if os.path.isdir(gerb):
+        for f in os.listdir(gerb):
+            os.remove(os.path.join(gerb, f))
+    else:
+        os.mkdir(gerb)
+
+    def cli(*args):
+        subprocess.run(["kicad-cli", "pcb", "export"] + list(args) + [PCB_PATH],
+                       check=True, cwd=HERE, stdout=subprocess.DEVNULL)
+
+    cli("gerbers", "-o", "gerbers/", "--use-drill-file-origin",
+        "--layers", "F.Cu,B.Cu,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,"
+                    "F.Paste,Edge.Cuts")
+    cli("drill", "-o", "gerbers/", "--format", "excellon",
+        "--drill-origin", "plot", "--excellon-separate-th",
+        "--generate-map", "--map-format", "gerberx2")
+    cli("pos", "-o", "cpl.csv", "--format", "csv", "--units", "mm",
+        "--side", "both", "--use-drill-file-origin")
+    for side, layers in (("front", "Edge.Cuts,F.Cu,F.Silkscreen,F.Mask"),
+                         ("back", "Edge.Cuts,B.Cu,B.Silkscreen,B.Mask")):
+        out = "preview-%s.svg" % side
+        cli("svg", "-o", out, "--page-size-mode", "2",
+            "--exclude-drawing-sheet", "--drill-shape-opt", "2",
+            "--layers", layers)   # not --mirror: it flips about the page
+        #                            centre, which moves the board out of the
+        #                            viewBox below.  The back view is drawn
+        #                            as seen THROUGH the board.
+        path = os.path.join(HERE, out)
+        t = open(path).read()
+        t = re.sub(r'width="[^"]+mm" height="[^"]+mm" viewBox="[^"]+"',
+                   'width="%.2fmm" height="%.2fmm" viewBox="-1.5 -1.5 %.2f %.2f"'
+                   % (BOARD_W + 3, BOARD_H + 3, BOARD_W + 3, BOARD_H + 3),
+                   t, count=1)
+        open(path, "w").write(t)
+        subprocess.run(["rsvg-convert", "-w", "1600", "-b", "#101418",
+                        out, "-o", "preview-%s.png" % side],
+                       check=True, cwd=HERE)
+    # kicad-cli drops local state next to the board; not a deliverable
+    for junk in (NAME + ".kicad_prl",):
+        fp = os.path.join(HERE, junk)
+        if os.path.exists(fp):
+            os.remove(fp)
+
+    zf = os.path.join(gerb, NAME + "_gerbers.zip")
+    with zipfile.ZipFile(zf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(os.listdir(gerb)):
+            if f.endswith(".zip"):
+                continue
+            z.write(os.path.join(gerb, f), f)
+    print("wrote gerbers/, cpl.csv, preview-front/back.svg+.png, %s"
+          % os.path.basename(zf))
+
+
+def main():
+    write_symbol_lib()
+    write_schematic()
+    write_project()
+    write_lib_tables()
+    print()
+    board = build_pcb()
+    print()
+    ok = verify(board)
+    print()
+    n = unrouted(board)
+    print()
+    run_drc(board)
+    write_bom()
+    export_all()
+    if not ok:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
