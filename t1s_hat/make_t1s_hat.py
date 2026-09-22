@@ -40,9 +40,16 @@ SCH_PATH = os.path.join(HERE, NAME + ".kicad_sch")
 PRO_PATH = os.path.join(HERE, NAME + ".kicad_pro")
 SYMDIR = os.path.join(HERE, "sym")
 SYMLIB = os.path.join(SYMDIR, "t1s_hat.kicad_sym")
+FPDIR = os.path.join(HERE, "fp", "t1s_hat.pretty")
 
 KSYM = "/usr/share/kicad/symbols/"
 KFP = "/usr/share/kicad/footprints/"
+
+
+def fp_dir(lib):
+    """Directory holding footprint library `lib`.  Project-local parts live in
+    fp/t1s_hat.pretty; everything else comes from the KiCad install."""
+    return FPDIR if lib == "t1s_hat" else KFP + lib + ".pretty"
 
 # ---------------------------------------------------------------- frame ----
 ORIGIN_X = 100.0
@@ -197,7 +204,10 @@ U1_NET = {
     2: "GND", 3: "GND", 5: "GND",
     4: "VDDP",          # TEST  "must be connected to VDDP"
     6: None, 15: None,  # DNC   "must be left floating externally"
-    7: "VDDP", 17: "VDDP",
+    # VDDP is one supply island, but on one layer its two halves cannot be
+    # joined without one crossing (see build_routes / README), so the pin-17
+    # half is its own net VDDP_17, linked to VDDP by the 0 ohm jumper JP1.
+    7: "VDDP", 17: "VDDP_17",
     8: "RESET_N", 9: "IRQ_N", 10: "SPI_MISO", 11: "SPI_CS_N",
     12: "SPI_SCLK", 13: "SPI_MOSI",
     14: "GND", 16: "GND",          # DIOB1 "connected directly to ground"
@@ -218,6 +228,7 @@ FP_R0805 = "Resistor_SMD:R_0805_2012Metric"
 FP_R1206 = "Resistor_SMD:R_1206_3216Metric"
 FP_L0603 = "Inductor_SMD:L_0603_1608Metric"
 FP_LED = "LED_SMD:LED_0603_1608Metric"
+FP_MOV = "t1s_hat:Varistor_TDK_AVRH10_1005"
 
 # ---------------------------------------------------------------------------
 # PARTS.  Each entry:
@@ -248,11 +259,19 @@ part("J1", "t1s_hat:HAT_HEADER_2x20",
            "the T-ETH-Elite's own 9.30 mm header pins")
 
 # --- bus interface network, AN1718 order: CMC - caps - term - ESD - CN1 -----
-part("L1", "Device:L_Coupled_1243", "130uH @ 100kHz CMC",
-     "Inductor_SMD:L_CommonMode_Wurth_WE-CNSW-1206",
-     {1: "TRXN", 2: "CMC_N", 3: "CMC_P", 4: "TRXP"},
-     (28.5, 26.6, 90), (250.0, 100.0),
-     descr="Common-mode choke, 130 uH @ 100 kHz (AN1718 L1). ALWAYS FITTED.")
+# L1: TDK ACT1210L-201-2P-TL00.  AN1718 names ACT1210D-131 / ACT1210E-241 /
+# Murata DLW32MH241MX2 as EXAMPLES ("exact part numbers ... must be determined
+# by the customer's unique application"), all 130...240 uH @ 100 kHz in a
+# 3.2 x 2.5 mm package.  The -201 is the same ACT1210 package at 200 uH, inside
+# that span, AEC-Q200, and -- unlike the three examples -- stocked at LCSC
+# (C131444), which is where this board gets built.  Windings are 1-4 and 2-3.
+part("L1", "Device:L_Coupled_1423", "200uH @ 100kHz CMC",
+     "t1s_hat:L_CommonMode_TDK_ACT1210_3225",
+     {1: "TRXP", 2: "TRXN", 3: "CMC_N", 4: "CMC_P"},
+     (28.5, 26.6, 90), (250.0, 100.0), lcsc="C131444",
+     descr="Common-mode choke, 2-line, 200 uH @ 100 kHz, EIA 1210 "
+           "(3.2x2.5 mm), AEC-Q200 - TDK ACT1210L-201-2P-TL00 (AN1718 L1). "
+           "ALWAYS FITTED.")
 part("C1", "Device:C", "100nF/100V", FP_C0805,
      {1: "CMC_P", 2: "BUS_P"}, (29.5, 30.8, 90), (250.0, 118.0),
      descr="AC coupling / galvanic isolation, bus P. ALWAYS FITTED (AN1718)")
@@ -273,17 +292,26 @@ part("R3", "Device:R", "100k 5%", FP_R0805,
 part("C3", "Device:C", "100nF/100V", FP_C0805,
      {1: "BUS_CT", 2: "GND"}, (26.1, 37, 180), (312.0, 127.0),
      descr="Common-mode termination, centre tap to ground (AN1718 C3)")
-part("MOV1", "Device:Varistor", "ESD 1206 (DNP)", FP_R1206,
+# MOV1/MOV2: the part ELECTRICAL.md already names, TDK AVRH10C221KT1R5YA8 --
+# a 1005 [0402] chip varistor, 220 V V1mA, 1.5 pF, 25 kV IEC61000-4-2, not the
+# 1206 land this board used to infer.  LCSC C2157827.
+part("MOV1", "Device:Varistor", "22V 1.5pF ESD (DNP)", FP_MOV,
      {1: "BUS_P", 2: "GND"}, (37.5, 37, 0), (330.0, 112.0), dnp=True,
-     descr="ESD element on bus P, at the connector (AN1718 MOV1). Optional.")
-part("MOV2", "Device:Varistor", "ESD 1206 (DNP)", FP_R1206,
+     lcsc="C2157827",
+     descr="ESD element on bus P, at the connector (AN1718 MOV1) - TDK "
+           "AVRH10C221KT1R5YA8 chip varistor, 1005 [0402], 1.5 pF. Optional.")
+part("MOV2", "Device:Varistor", "22V 1.5pF ESD (DNP)", FP_MOV,
      {1: "BUS_N", 2: "GND"}, (21, 37, 180), (330.0, 142.0), dnp=True,
-     descr="ESD element on bus N, at the connector (AN1718 MOV2). Optional.")
+     lcsc="C2157827",
+     descr="ESD element on bus N, at the connector (AN1718 MOV2) - TDK "
+           "AVRH10C221KT1R5YA8 chip varistor, 1005 [0402], 1.5 pF. Optional.")
 part("CN1", "Connector_Generic:Conn_01x04", "T1S BUS  P N N P",
      "Connector_Phoenix_MC:PhoenixContact_MC_1,5_4-G-3.81_1x04_"
      "P3.81mm_Horizontal",
      {1: "BUS_P", 2: "BUS_N", 3: "BUS_N", 4: "BUS_P"},
-     (30.405, 41, 180), (360.0, 127.0),
+     # 0.35 mm in from y = 41: the body outline otherwise lands 0.02 mm from
+     # Edge.Cuts and the silk is clipped at the board edge.
+     (30.405, 40.65, 180), (360.0, 127.0),
      descr="MDI connector, 4-pin 3.81 mm pluggable terminal block. "
            "Pins 1..4 = P N N P; the two P and the two N are shorted on "
            "board so the node taps a daisy chain.")
@@ -330,16 +358,19 @@ part("C8", "Device:C", "10nF", FP_C0603,
      {1: "VDDP", 2: "GND"}, (20.5, 16, 0), (105.0, 45.0),
      descr="VDDP (pin 7) decoupling, 0.01 uF - closest to the pin")
 part("C9", "Device:C", "100nF", FP_C0603,
-     {1: "VDDP", 2: "GND"}, (45, 9.5, 0), (120.0, 45.0),
+     {1: "VDDP_17", 2: "GND"}, (45, 9.5, 0), (120.0, 45.0),
      descr="VDDP (pin 17) decoupling, 0.1 uF")
 part("C10", "Device:C", "10nF", FP_C0603,
-     {1: "VDDP", 2: "GND"}, (42, 9.5, 180), (135.0, 45.0),
+     {1: "VDDP_17", 2: "GND"}, (42, 9.5, 180), (135.0, 45.0),
      descr="VDDP (pin 17) decoupling, 0.01 uF - closest to the pin")
+# C11/C12 sit 0.8 mm further out than the QFN would like so that their ground
+# stitching vias clear the all-layer void under the choke, which grew when L1
+# went to its real 3.2 x 2.5 mm body.
 part("C11", "Device:C", "100nF", FP_C0603,
-     {1: "VDDA", 2: "GND"}, (31.6, 28, 180), (150.0, 45.0),
+     {1: "VDDA", 2: "GND"}, (32.4, 28, 180), (150.0, 45.0),
      descr="VDDA (pin 29) decoupling, 0.1 uF")
 part("C12", "Device:C", "10nF", FP_C0603,
-     {1: "VDDA", 2: "GND"}, (31.6, 26.4, 180), (165.0, 45.0),
+     {1: "VDDA", 2: "GND"}, (32.4, 26.4, 180), (165.0, 45.0),
      descr="VDDA (pin 29) decoupling, 0.01 uF - closest to the pin")
 part("C13", "Device:C", "100nF", FP_C0603,
      {1: "VDDAU", 2: "GND"}, (47.5, 27.6, 0), (180.0, 45.0),
@@ -360,9 +391,14 @@ part("R4", "Device:R", "10k", FP_R0603,
      {1: "+3V3", 2: "RESET_N"}, (24, 15, 0), (95.0, 95.0),
      descr="RESET_N pull-up: a floating host GPIO during ESP32 boot must not "
            "hold the PHY in reset")
+# R5 straddles the SPI_MISO column: MISO runs between its two pads, so the
+# resistor that has to be in the CS_N path anyway is also the layer crossing
+# that path needs.  0603 pads are 0.85 mm apart, a 0.25 mm track leaves
+# 0.30 mm a side.  See README, "Two crossings on one layer".
 part("R5", "Device:R", "10k", FP_R0603,
-     {1: "+3V3", 2: "SPI_CS_N"}, (50, 12.4, 180), (95.0, 105.0),
-     descr="SPI CS_N pull-up")
+     {1: "+3V3", 2: "SPI_CS_N"}, (32.326, 9.5, 0), (95.0, 105.0),
+     descr="SPI CS_N pull-up; also the F.Cu crossover for SPI_MISO, which "
+           "passes between its pads")
 part("R6", "Device:R", "10k", FP_R0603,
      {1: "+3V3", 2: "IRQ_N"}, (28.6, 12.4, 180), (95.0, 115.0),
      descr="IRQ_N pull-up (open-drain capable interrupt output)")
@@ -381,12 +417,25 @@ part("D2", "Device:LED", "YEL", FP_LED,
      {2: "LED1_A", 1: "LED1_K"}, (44, 21.5, 0), (345.0, 75.0),
      descr="Status LED 1 on DIOA1 - firmware maps it (e.g. activity)")
 
+# --- layer crossing ---------------------------------------------------------
+# DIRECTED: a deliberate 0 ohm jumper, not an oversight.  VDDP's pin-7 island
+# is fenced in by the +3V3 tree, the header and the SPI fan-out; on one signal
+# layer exactly one crossing is unavoidable, and B.Cu is not available for it
+# (the uninterrupted bottom pour is what buys back the fourth layer here).
+# JP1 straddles the +3V3 branch that runs up the left edge: +3V3 passes
+# between its two pads.
+part("JP1", "Device:R", "0R jumper", FP_R0603,
+     {1: "VDDP", 2: "VDDP_17"}, (6.90, 8.70, 180), (110.0, 80.0),
+     descr="0 ohm link, VDDP pin-7 island to VDDP pin-17 island. The 2-layer "
+           "crossover for +3V3, which passes between its pads. FITTED - the "
+           "board does not work without it.")
+
 BY_REF = {p["ref"]: p for p in P}
 
 # Nets that get a PWR_FLAG on the schematic: their only drivers on this board
 # are passive (the header, or a 0 ohm bead), so ERC needs to be told they are
 # supplies.
-PWR_FLAG_NETS = ["+3V3", "GND", "VDDP", "VDDA", "VDDAU"]
+PWR_FLAG_NETS = ["+3V3", "GND", "VDDP", "VDDP_17", "VDDA", "VDDAU"]
 
 
 # ===========================================================================
@@ -496,6 +545,114 @@ def write_symbol_lib():
 
 
 # ===========================================================================
+#  FOOTPRINT LIBRARY -- two lands KiCad does not ship, each drawn from the
+#  chosen part's own datasheet.  Nothing here is scaled off a picture or
+#  guessed from a neighbouring size code.
+# ===========================================================================
+def _mod(name, descr, tags, pads, silk=(), crtyd=(0, 0), attr="smd"):
+    """Emit a .kicad_mod.  pads: (number, x, y, w, h).  crtyd: (half_x, half_y).
+    silk: list of (x1, y1, x2, y2) lines on F.SilkS."""
+    s = '(footprint "%s" (version 20221018) (generator t1s_hat)\n' % name
+    s += '  (layer "F.Cu")\n'
+    s += '  (descr "%s")\n  (tags "%s")\n' % (descr, tags)
+    s += '  (attr %s)\n' % attr
+    s += ('  (fp_text reference "REF**" (at 0 %.3f) (layer "F.SilkS")\n'
+          '    (effects (font (size 0.8 0.8) (thickness 0.12)))\n  )\n'
+          % (-crtyd[1] - 0.7))
+    s += ('  (fp_text value "%s" (at 0 %.3f) (layer "F.Fab") hide\n'
+          '    (effects (font (size 0.8 0.8) (thickness 0.12)))\n  )\n'
+          % (name, crtyd[1] + 0.7))
+    for x1, y1, x2, y2 in silk:
+        s += ('  (fp_line (start %.4f %.4f) (end %.4f %.4f)\n'
+              '    (stroke (width 0.12) (type solid)) (layer "F.SilkS"))\n'
+              % (x1, y1, x2, y2))
+    cx, cy = crtyd
+    for x1, y1, x2, y2 in ((-cx, -cy, cx, -cy), (cx, -cy, cx, cy),
+                           (cx, cy, -cx, cy), (-cx, cy, -cx, -cy)):
+        s += ('  (fp_line (start %.4f %.4f) (end %.4f %.4f)\n'
+              '    (stroke (width 0.05) (type solid)) (layer "F.CrtYd"))\n'
+              % (x1, y1, x2, y2))
+    for num, x, y, w, h in pads:
+        s += ('  (pad "%s" smd roundrect (at %.4f %.4f) (size %.4f %.4f)\n'
+              '    (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.2))\n'
+              % (num, x, y, w, h))
+    s += ')\n'
+    return s
+
+
+# --- L1: TDK ACT1210L-201-2P-TL00, EIA 1210 (3.2 x 2.5 mm) 4-terminal CMC ---
+# DIRECTED: AN1718's example chokes (ACT1210D-131, ACT1210E-241, Murata
+# DLW32MH241MX2) are all 3.2 x 2.5 mm parts; the stock KiCad footprint used
+# before was an 1206 (3.2 x 1.6 mm) land, 0.9 mm too narrow, and KiCad ships no
+# 4-terminal CMC land in this size.  The part actually fitted is the
+# ACT1210L-201-2P-TL00 -- same ACT1210 package, 200 uH @ 100 kHz (inside
+# AN1718's 130...240 uH span), AEC-Q200, and stocked at LCSC as C131444.
+#
+# Land pattern quoted from TDK's ACT1210 data sheet, "Layout recommendation"
+# (drawing IND1512-9, TDK Electronics ACT1210, June 2025, page 3):
+#     overall across the pads   4.1 mm      -> pad length = (4.1-2.0)/2 = 1.05
+#     gap between the columns   2.0 mm      -> pad centres at +/- 1.525
+#     overall across the rows   1.6 mm      -> pad width  = (1.6-0.4)/2 = 0.60
+#     gap between the rows      0.4 mm      -> pad centres at +/- 0.50
+# Body, same data sheet: 3.2 +/-0.2 long, 2.5 +/-0.2 wide, 3.9 max over the
+# terminals, 2.5 max high.  Courtyard = 3.9 x 2.7 max body + 0.25 mm a side.
+# Pin configuration and circuit diagram: 1 and 2 are one end, 3 and 4 the
+# other, the windings are 1-4 and 2-3 -- which is Device:L_Coupled_1423.
+ACT1210_PAD_L = 1.05
+ACT1210_PAD_W = 0.60
+ACT1210_PITCH_X = 1.525
+ACT1210_PITCH_Y = 0.50
+
+# --- MOV1/MOV2: TDK AVRH10C221KT1R5YA8, the part ELECTRICAL.md already names -
+# It is a 1005 [0402] chip varistor -- 1.0 x 0.5 x 0.5 mm -- not the 1206 the
+# board previously assumed (three size codes out).  LCSC C2157827.
+# Land pattern quoted from TDK's "Chip varistors / Automotive grade / AVR
+# series" catalogue (vpd_automotive_varistors_avr_en, March 2026), AVRH 1005
+# RECOMMENDED LAND PATTERN: pad length 0.35...0.45, gap 0.3...0.5, pad width
+# 0.4...0.6.  Middle of each range: 0.40 long, 0.40 gap, 0.50 wide, so the pad
+# centres sit at +/- 0.40.  (KiCad's R_0402_1005Metric is 0.54 x 0.64 on a
+# 1.02 mm pitch -- outside every one of those three ranges, which is why this
+# is drawn here instead.)  Body 1.0 +/-0.05 x 0.5 +/-0.05; courtyard = the
+# larger of body and land, + 0.25 mm a side.
+AVRH10_PAD_L = 0.40
+AVRH10_PAD_W = 0.50
+AVRH10_PITCH = 0.40
+
+
+def write_footprint_lib():
+    os.makedirs(FPDIR, exist_ok=True)
+    mods = {}
+
+    px, py = ACT1210_PITCH_X, ACT1210_PITCH_Y
+    w, h = ACT1210_PAD_L, ACT1210_PAD_W
+    mods["L_CommonMode_TDK_ACT1210_3225"] = _mod(
+        "L_CommonMode_TDK_ACT1210_3225",
+        "TDK ACT1210 series 2-line common-mode choke, EIA 1210 "
+        "(3.2x2.5 mm), 4 terminals. Land pattern from the TDK ACT1210 data "
+        "sheet layout recommendation (4.1 x 1.6 overall, 2.0 and 0.4 gaps).",
+        "common mode choke CMC ACT1210 3225 1210 TDK 10BASE-T1S",
+        [("1", -px, py, w, h), ("2", -px, -py, w, h),
+         ("3", px, -py, w, h), ("4", px, py, w, h)],
+        silk=[(-1.95, -1.45, 1.95, -1.45), (-1.95, 1.45, 1.95, 1.45)],
+        crtyd=(2.20, 1.60))
+
+    p, w, h = AVRH10_PITCH, AVRH10_PAD_L, AVRH10_PAD_W
+    mods["Varistor_TDK_AVRH10_1005"] = _mod(
+        "Varistor_TDK_AVRH10_1005",
+        "TDK AVRH10 series chip varistor, 1005 [0402] (1.0x0.5 mm). Land "
+        "pattern from TDK's AVR automotive catalogue recommended land "
+        "(0.40 pad, 0.40 gap, 0.50 wide).",
+        "varistor ESD MOV AVRH10 1005 0402 TDK 10BASE-T1S",
+        [("1", -p, 0, w, h), ("2", p, 0, w, h)],
+        crtyd=(0.85, 0.55))
+
+    for name, text in sorted(mods.items()):
+        with open(os.path.join(FPDIR, name + ".kicad_mod"), "w") as f:
+            f.write(text)
+    print("wrote %s (%d footprints)" % (FPDIR, len(mods)))
+
+
+# ===========================================================================
 #  s-expression helpers: pull a symbol definition out of a .kicad_sym
 # ===========================================================================
 _SYM_CACHE = {}
@@ -578,6 +735,7 @@ SCH_POS = {
     "FB1": (158, 45), "C11": (182, 45), "C12": (197, 45),
     "FB2": (222, 45), "C13": (246, 45), "C14": (261, 45),
     "C4": (290, 45), "C5": (305, 45),
+    "JP1": (110, 80),
     "J1": (60, 130),
     "R4": (110, 100), "R5": (110, 125), "R6": (110, 150),
     "U1": (190, 130),
@@ -778,6 +936,9 @@ def write_schematic():
     sch_text(30, 62, "SUPPLY + DECOUPLING   0.1uF and 0.01uF at EVERY power "
                      "pin, 0.01uF nearest.  FB1..3 are the data sheet's "
                      "optional supply-island beads, fitted as 0R.", 1.8, "g1")
+    sch_text(60, 76, "JP1 - 0 ohm link. VDDP is one supply island; on two "
+                     "layers its two halves need one crossing, and JP1 is it. "
+                     "FITTED.", 1.8, "g7")
     sch_text(255, 85, "BUS INTERFACE NETWORK (AN1718 MINIMAL BIN)   "
                       "CMC - AC coupling - termination - ESD - MDI connector",
              1.8, "g2")
@@ -831,7 +992,7 @@ NETCLASSES = [
          via_diameter=0.60, via_drill=0.30),
     dict(name="Power", clearance=0.15, track_width=0.45,
          via_diameter=0.70, via_drill=0.35,
-         nets=["+3V3", "GND", "VDDP", "VDDA", "VDDAU"]),
+         nets=["+3V3", "GND", "VDDP", "VDDP_17", "VDDA", "VDDAU"]),
     dict(name="T1S", clearance=0.15, track_width=0.35,
          via_diameter=0.60, via_drill=0.30, nets=T1S_NETS),
 ]
@@ -886,7 +1047,11 @@ def write_lib_tables():
                 '(uri "${KIPRJMOD}/sym/t1s_hat.kicad_sym")'
                 '(options "")(descr "Parts created for this board"))\n)\n')
     with open(os.path.join(HERE, "fp-lib-table"), "w") as f:
-        f.write('(fp_lib_table\n  (version 7)\n)\n')
+        f.write('(fp_lib_table\n  (version 7)\n'
+                '  (lib (name "t1s_hat")(type "KiCad")'
+                '(uri "${KIPRJMOD}/fp/t1s_hat.pretty")'
+                '(options "")(descr "Lands drawn from the chosen parts\' own '
+                'data sheets"))\n)\n')
     print("wrote sym-lib-table, fp-lib-table")
 
 
@@ -942,6 +1107,21 @@ def add_text(board, txt, gx, gy, h=1.0, w=None, th=0.15, angle=0,
         t.SetMirrored(True)
     board.Add(t)
     return t
+
+
+def add_dot(board, layer, gx, gy, r):
+    """Filled circle.  One shape, so -- unlike a stroked triangle, whose legs
+    overlap each other at the apex -- it cannot violate silk clearance against
+    itself."""
+    s = pcbnew.PCB_SHAPE(board)
+    s.SetShape(pcbnew.SHAPE_T_CIRCLE)
+    s.SetStart(V(gx, gy))
+    s.SetEnd(V(gx + r, gy))
+    s.SetLayer(layer)
+    s.SetWidth(MM(0.05))
+    s.SetFilled(True)
+    board.Add(s)
+    return s
 
 
 def add_npth(board, ref, gx, gy, diameter, descr):
@@ -1050,7 +1230,7 @@ def place_header(board):
 
 def place_part(board, p):
     lib, fpn = p["fp"].split(":", 1)
-    fp = pcbnew.FootprintLoad(KFP + lib + ".pretty", fpn)
+    fp = pcbnew.FootprintLoad(fp_dir(lib), fpn)
     if fp is None:
         raise RuntimeError("footprint %s not found" % p["fp"])
     fp.SetFPID(pcbnew.LIB_ID(lib, fpn))
@@ -1202,13 +1382,15 @@ def build_routes():
     # ================= T1S pair, U1 -> CMC -> caps -> term -> CN1 =========
     # Symmetric about x = 29.0 from the QFN all the way to the connector, so
     # the two legs are the same length by construction.  No vias on either.
+    # L1 pad order is the ACT1210's own: 1 and 2 at the chip end, 3 and 4 at
+    # the connector end, windings 1-4 (P) and 2-3 (N).
     R(("TRXP", WQ, [("U1", "30"), (29.25, 24.75), (29.00, 25.00)]))
-    R(("TRXP", WT, [(29.00, 25.00), ("L1", "4")]))
+    R(("TRXP", WT, [(29.00, 25.00), ("L1", "1")]))
     R(("TRXN", WQ, [("U1", "31"), (28.75, 24.00), (28.00, 24.75)]))
-    R(("TRXN", WT, [(28.00, 24.75), ("L1", "1")]))
-    R(("CMC_P", WT, [("L1", "3"), (29.00, 29.10), (29.50, 29.60),
+    R(("TRXN", WT, [(28.00, 24.75), ("L1", "2")]))
+    R(("CMC_P", WT, [("L1", "4"), (29.00, 29.10), (29.50, 29.60),
                      ("C1", "1")]))
-    R(("CMC_N", WT, [("L1", "2"), (28.00, 29.10), (27.50, 29.60),
+    R(("CMC_N", WT, [("L1", "3"), (28.00, 29.10), (27.50, 29.60),
                      ("C2", "1")]))
     R(("BUS_P", WT, [("C1", "2"), (29.50, 32.80), (33.46, 32.80),
                      (33.46, 38.40), (30.405, 38.40), ("CN1", "1")]))
@@ -1247,10 +1429,10 @@ def build_routes():
     R(("VDDAU", WF, [(44.00, 27.60), ("C13", "1")]))
 
     # ================= QFN right edge =====================================
-    R(("VDDP", WF, [("U1", "17"), (33.40, 17.60), (47.566, 17.60),
-                    (47.566, 8.00)]))
-    R(("VDDP", WF, [(47.566, 8.00), (44.225, 8.00), ("C9", "1"),
-                    ("C10", "1")]))
+    R(("VDDP_17", WF, [("U1", "17"), (33.40, 17.60), (47.566, 17.60),
+                       (47.566, 8.00)]))
+    R(("VDDP_17", WF, [(47.566, 8.00), (44.225, 8.00), ("C9", "1"),
+                       ("C10", "1")]))
     R(("LED0_K", WS, [("U1", "18"), (43.213, 18.75), ("D1", "1")]))
     R(("LED1_K", WS, [("U1", "19"), (42.00, 19.25), (42.00, 21.50),
                       ("D2", "1")]))
@@ -1273,8 +1455,24 @@ def build_routes():
     R(("VDDP", WF, [(19.626, 13.60), (18.975, 13.60), ("FB3", "2")]))
     R(("VDDP", WF, [(19.626, 18.75), (19.626, 16.00), ("C8", "1")]))
     R(("VDDP", WF, [(19.626, 16.00), (19.626, 13.60), ("C7", "1")]))
-    R(("RESET_N", WS, [("U1", "8"), (24.706, 18.25), (24.706, 3.36),
-                       ("J1", "15")]))
+    # --- the one crossing a single signal layer cannot absorb --------------
+    # VDDP's pin-7 island is enclosed by the +3V3 tree (bottom rail, left
+    # hook, riser), the header row and the SPI fan-out, so reaching the
+    # pin-17 island costs exactly one crossing.  It is taken at the +3V3
+    # branch that climbs the left edge, where there is room for a real 0603
+    # jumper: +3V3 passes between JP1's pads, and VDDP_17 then runs round the
+    # outside of the header in the free 1 mm lane below it (nothing else goes
+    # under the header: the +3V3 rail stops at y = 2.0, MOSI's return at
+    # y = 1.35, and both turn upward before this lane).
+    R(("VDDP", WF, [(19.626, 13.60), (19.626, 8.70), ("JP1", "1")]))
+    R(("VDDP_17", WP, [("JP1", "2"), (6.075, 0.80), (42.486, 0.80)]))
+    # the climb back up runs between two header pad columns: 0.30 mm wide, so
+    # it keeps 0.27 mm to each 1.7 mm pad
+    R(("VDDP_17", WF, [(42.486, 0.80), (42.486, 8.00), (44.225, 8.00)]))
+    # the waypoint at y = 14.00 is where R4's leg joins: splitting the column
+    # there turns a T into three real segment ends, so nothing reads dangling
+    R(("RESET_N", WS, [("U1", "8"), (24.706, 18.25), (24.706, 14.00),
+                       (24.706, 3.36), ("J1", "15")]))
 
     # ================= QFN bottom edge: SPI down to the header ============
     # Lanes fan out so that no two of the five cross; MOSI is the one signal
@@ -1302,16 +1500,17 @@ def build_routes():
     R(("+3V3", 0.40, [(22.166, 2.00), (22.166, 15.00), ("R4", "1")]))
     R(("+3V3", 0.40, [(13.50, 10.50), (13.50, 46.50), (52.646, 46.50),
                       (52.646, 31.90), (44.00, 31.90), ("FB2", "1")]))
-    R(("+3V3", 0.40, [(52.646, 31.90), (52.646, 12.40)]))
+    R(("+3V3", 0.40, [(52.646, 31.90), (52.646, 19.00)]))
     R(("+3V3", WF, [(13.50, 18.00), ("C6", "1")]))
     R(("+3V3", WP, [(44.00, 31.90), (33.00, 31.90), ("FB1", "1")]))
     R(("+3V3", WF, [(52.646, 19.00), ("R8", "1")]))
     R(("+3V3", WF, [(52.646, 21.50), ("R9", "1")]))
-    # R5 (CS_N pull-up) sits on the far side of MOSI's return column, so its
-    # 3V3 arrives from the right-hand rail and its CS_N leg reaches back to
-    # the CS_N column.  See README: this is the one crossing the single layer
-    # cannot absorb, and it is left as an explicit gap, not hidden.
-    R(("+3V3", WF, [(52.646, 12.40), ("R5", "1")]))
+    # R5 sits astride the MISO column, inside the loop MOSI's return traces,
+    # so its 3V3 comes off the column that already feeds R6 and its CS_N leg
+    # lands straight on the CS_N column.  MISO passes between R5's own pads:
+    # that is the crossing, and it costs no extra part.
+    R(("+3V3", WS, [(29.786, 9.50), ("R5", "1")]))
+    R(("SPI_CS_N", WS, [("R5", "2"), (34.866, 9.50)]))
     R(("LED0_A", WS, [("D1", "2"), ("R8", "2")]))
     R(("LED1_A", WS, [("D2", "2"), ("R9", "2")]))
     R(("RESET_N", WS, [("R4", "2"), (24.706, 14.00)]))
@@ -1328,8 +1527,8 @@ def build_routes():
             ("C3", "2", 25.15, 35.60), ("R3", "2", 31.812, 35.60),
             ("MOV1", "2", 40.10, 37.00), ("MOV2", "2", 18.50, 37.00),
             ("C15", "2", 35.65, 30.90), ("C16", "2", 38.15, 30.90),
-            ("R7", "2", 41.00, 28.70), ("C11", "2", 30.20, 28.00),
-            ("C12", "2", 30.20, 26.40), ("C13", "2", 49.10, 27.60),
+            ("R7", "2", 41.00, 28.70), ("C11", "2", 30.70, 28.00),
+            ("C12", "2", 30.70, 26.40), ("C13", "2", 49.10, 27.60),
             ("C14", "2", 49.10, 26.00), ("C4", "2", 41.40, 20.55, 0.45, 0.25),
             ("C5", "2", 36.90, 20.20), ("C6", "2", 17.90, 18.00),
             ("C7", "2", 20.625, 12.40), ("C9", "2", 46.30, 9.50),
@@ -1355,8 +1554,14 @@ def build_routes():
 BIN_VOID = (21.0, 23.4, 40.5, 39.8)
 # All-layer void under the common-mode choke (AN1718 guideline 6): this one
 # DOES cut B.Cu, and it is the only place other than the antenna window that
-# does.  Sized to the choke body, not its pads.
-CMC_VOID = (27.55, 24.35, 29.45, 28.85)
+# does.  AN1718 gives no dimension, so it is sized to the part and no further:
+# the ACT1210's maximum body, 3.9 mm over the terminals x 2.7 mm wide
+# (2.5 + tolerance), plus 0.25 mm a side for placement.  That also covers the
+# 4.1 x 1.6 land with margin, and it is the whole of what couples to the
+# plane -- the core.  L1 is rotated 90 deg, so the 3.9 runs along y.
+CMC_MARGIN = 0.25
+CMC_VOID = (28.5 - (2.7 / 2 + CMC_MARGIN), 26.6 - (3.9 / 2 + CMC_MARGIN),
+            28.5 + (2.7 / 2 + CMC_MARGIN), 26.6 + (3.9 / 2 + CMC_MARGIN))
 
 
 def add_zones(board):
@@ -1390,43 +1595,54 @@ def add_zones(board):
 
 
 def draw_silk(board):
-    cx = BOARD_W / 2.0
-    add_text(board, "T1S HAT  LAN8651  10BASE-T1S", 41.0, 47.2,
-             h=1.5, w=1.2, th=0.24)
-    add_text(board, "for LilyGO T-ETH-Elite", 41.0, 45.2, h=1.0, th=0.16)
+    # Board-level ink lives in the two areas that carry no pads: the strip
+    # left of the bus network (x 2.5..20, y 27..44) and the top right corner
+    # (x 36..60, y 45..48.5).  Everything is kept clear of CN1's own body
+    # outline, which starts at x = 16.2 above y = 38.3.
+    add_text(board, "T1S HAT   LAN8651", 48.0, 47.6, h=1.4, w=1.1, th=0.22)
+    add_text(board, "10BASE-T1S for LilyGO T-ETH-Elite", 48.0, 45.9,
+             h=0.8, w=0.65, th=0.13)
 
-    # bus connector legend -- the pad order is P N N P, so label every pin
-    for i, lab in enumerate(("P", "N", "N", "P")):
-        add_text(board, lab, 19.475 + 3.81 * i, 38.9, h=1.3, w=1.1, th=0.22)
-    add_text(board, "T1S BUS", 11.0, 41.0, h=1.4, w=1.2, th=0.22)
-    add_text(board, "1-2 and 3-4 are the same pair;", 11.0, 39.0, h=0.8,
-             th=0.13)
-    add_text(board, "wire P to P, N to N.", 11.0, 37.8, h=0.8, th=0.13)
+    # bus connector legend.  The four pads are 1.8 x 3.6 mm ovals with the
+    # connector's own body outline 0.9 mm below them and R3/C3 0.6 mm below
+    # that, so there is nowhere to letter each pad without printing on copper
+    # or on CN1's outline: the order goes in the legend instead.
+    add_text(board, "T1S BUS", 2.5, 43.6, h=1.3, w=1.05, th=0.22, just="left")
+    add_text(board, "1-2 = 3-4", 2.5, 41.7, h=0.9, w=0.72, th=0.14,
+             just="left")
+    add_text(board, "same pair", 2.5, 40.5, h=0.9, w=0.72, th=0.14,
+             just="left")
+    add_text(board, "wire P-P, N-N", 2.5, 39.3, h=0.9, w=0.72, th=0.14,
+             just="left")
+    add_text(board, "CN1  1=P 2=N 3=N 4=P", 2.5, 37.3, h=0.9, w=0.70,
+             th=0.14, just="left")
 
     # termination stuffing, the one thing an assembler must decide
     for i, line in enumerate((
-            "R1 R2  TERMINATION - SHIPPED UNSTUFFED",
-            "END OF BUS ....... 49R9  1%  1W",
-            "INTERIOR DROP .... 1K5   1%",
-            "R3/C3 common mode: fitted")):
-        add_text(board, line, 8.0, 33.0 - 1.35 * i, h=0.9, w=0.75, th=0.14,
+            "R1 R2 = TERMINATION (DNP)",
+            "END OF BUS ... 49R9 1% 1W",
+            "DROP NODE .... 1K5  1%",
+            "R3 C3 fitted")):
+        add_text(board, line, 2.5, 31.4 - 1.55 * i, h=0.9, w=0.70, th=0.14,
                  just="left")
 
-    # antenna keepout, marked so nobody fills it in later
+    # antenna keepout, marked so nobody fills it in later.  The window runs to
+    # the board edge; the ink stops 0.32 mm short of it so the silk does not
+    # sit on Edge.Cuts.
     x0, y0, x1, y1 = KEEPOUT
-    for a, b in (((x0, y0), (x1, y0)), ((x0, y1), (x1, y1)),
+    xe = x1 - 0.32
+    for a, b in (((x0, y0), (xe, y0)), ((x0, y1), (xe, y1)),
                  ((x0, y0), (x0, y1))):
         add_seg(board, pcbnew.F_SilkS, a, b, SILK_W)
     add_text(board, "ANTENNA", 62.0, 35.0, h=1.2, w=1.0, th=0.2, angle=90)
     add_text(board, "KEEPOUT - NO COPPER", 60.2, 33.0, h=0.9, w=0.75,
              th=0.14, angle=90)
 
-    # pin-1 markers
-    px1, _ = pin_xy(1)
-    add_seg(board, pcbnew.F_SilkS, (px1 - 0.9, 8.0), (px1 + 0.9, 8.0), SILK_W)
-    add_seg(board, pcbnew.F_SilkS, (px1 - 0.9, 8.0), (px1, 9.2), SILK_W)
-    add_seg(board, pcbnew.F_SilkS, (px1 + 0.9, 8.0), (px1, 9.2), SILK_W)
-    add_text(board, "J1 PIN 1", 13.6, 8.6, h=0.9, th=0.14, just="left")
+    # pin-1 marker: a dot OUTBOARD of pin 1, not a triangle above it -- above
+    # is where JP1 has to sit, and the two collided there.
+    px1, py1 = pin_xy(1)
+    add_dot(board, pcbnew.F_SilkS, px1 - 2.2, py1, 0.40)
+    add_text(board, "J1 PIN 1", 9.6, 8.6, h=0.9, th=0.14, just="left")
 
     add_text(board, "LED0 DIOA0", 51.5, 23.5, h=0.8, w=0.7, th=0.13,
              just="left")
@@ -1439,6 +1655,121 @@ def draw_silk(board):
     add_text(board, "socket faces down - use a 2x20 riser, "
                     "not one tall stacking header", 33.0, 22.0, h=1.0,
              th=0.16, layer=pcbnew.B_SilkS, mirror=True)
+
+    place_references(board)
+
+
+# ---------------------------------------------------------------------------
+# REFERENCE DESIGNATORS
+# ---------------------------------------------------------------------------
+# Library footprints put their reference wherever the library author did,
+# which on a board this dense means designators on pads and on each other.
+# They are placed here instead: each one is tried in a ring of candidate
+# positions around its own part and kept at the first that touches no pad, no
+# via, no other ink and no board edge.  A part with nowhere legible left loses
+# its designator rather than printing an unreadable pile -- cpl.csv and
+# bom.csv carry it, and so does the assembly drawing.
+SILK_GAP = 0.15            # mm, on top of the 0.10 mm board silk clearance
+REF_SIZE = (0.70, 0.80)    # w, h
+REF_TH = 0.12
+
+# Two parts are big enough that the ring around them lands somewhere silly;
+# these spots are tried first and still have to pass the same clearance test.
+REF_HINT = {"J1": (59.0, 8.6), "U1": (25.6, 21.8),
+            "R1": (28.2, 33.3), "Y1": (38.0, 24.4)}
+
+
+def _box(item, grow=0.0):
+    bb = item.GetBoundingBox()
+    g = MM(grow)
+    return (bb.GetLeft() - g, bb.GetTop() - g,
+            bb.GetRight() + g, bb.GetBottom() + g)
+
+
+def _hit(a, b):
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def silk_obstacles(board):
+    """Everything a designator must not touch: copper that would show through
+    the silk (pads, vias) and ink that is already placed."""
+    obs = []
+    for fp in board.GetFootprints():
+        for pad in fp.Pads():
+            obs.append(_box(pad, SILK_GAP))
+        for it in fp.GraphicalItems():
+            if it.GetLayer() == pcbnew.F_SilkS:
+                obs.append(_box(it, SILK_GAP))
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_VIA_T:
+            obs.append(_box(t, SILK_GAP))
+    for d in board.GetDrawings():
+        if d.GetLayer() == pcbnew.F_SilkS:
+            obs.append(_box(d, SILK_GAP))
+    return obs
+
+
+def place_references(board):
+    obs = silk_obstacles(board)
+    inset = 0.45                       # keep the ink off Edge.Cuts
+    lim = (MM(ORIGIN_X + inset), MM(ORIGIN_Y - BOARD_H + inset),
+           MM(ORIGIN_X + BOARD_W - inset), MM(ORIGIN_Y - inset))
+    dirs = [(0, 1), (0, -1), (1, 0), (-1, 0),
+            (1, 1), (-1, 1), (1, -1), (-1, -1)]
+    dropped = []
+    for fp in sorted(board.GetFootprints(), key=lambda f: f.GetReference()):
+        ref = fp.Reference()
+        if not ref.IsVisible():
+            continue
+        ref.SetTextSize(SZ(*REF_SIZE))
+        ref.SetTextThickness(MM(REF_TH))
+        pads = list(fp.Pads())
+        if not pads:
+            continue
+        pb = _box(pads[0])
+        for pad in pads[1:]:
+            b = _box(pad)
+            pb = (min(pb[0], b[0]), min(pb[1], b[1]),
+                  max(pb[2], b[2]), max(pb[3], b[3]))
+        cx, cy = (pb[0] + pb[2]) // 2, (pb[1] + pb[3]) // 2
+        hx, hy = (pb[2] - pb[0]) // 2, (pb[3] - pb[1]) // 2
+        placed = False
+        # Horizontal first; a part with no room for a horizontal designator
+        # gets a sideways one before it gets none at all.  FP_TEXT angles are
+        # relative to the footprint, so the part's own rotation is cancelled.
+        for ang in (0, 90):
+            ref.SetTextAngle(pcbnew.EDA_ANGLE(
+                ang - fp.GetOrientationDegrees(), pcbnew.DEGREES_T))
+            ref.SetPosition(pcbnew.VECTOR2I(int(cx), int(cy)))
+            tb = _box(ref)
+            tx, ty = (tb[2] - tb[0]) // 2, (tb[3] - tb[1]) // 2
+            cand = []
+            if ang == 0 and fp.GetReference() in REF_HINT:
+                v = V(*REF_HINT[fp.GetReference()])
+                cand.append((v.x, v.y))
+            for gap in (0.30, 0.55, 0.85, 1.25, 1.75, 2.40):
+                for sx, sy in dirs:
+                    cand.append((cx + sx * (hx + tx + MM(gap)),
+                                 cy + sy * (hy + ty + MM(gap))))
+            for px, py in cand:
+                ref.SetPosition(pcbnew.VECTOR2I(int(px), int(py)))
+                tb = _box(ref, SILK_GAP)
+                if (tb[0] < lim[0] or tb[1] < lim[1] or
+                        tb[2] > lim[2] or tb[3] > lim[3]):
+                    continue
+                if any(_hit(tb, o) for o in obs):
+                    continue
+                obs.append(tb)
+                placed = True
+                break
+            if placed:
+                break
+        if not placed:
+            ref.SetVisible(False)
+            dropped.append(fp.GetReference())
+    print("references placed; %d dropped as illegible%s"
+          % (len(dropped), (": " + ", ".join(dropped)) if dropped else ""))
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1630,6 +1961,37 @@ def verify(board):
     row("B.Cu signals", "0 tracks", "%d tracks" % len(bcu_tracks),
         (float(len(bcu_tracks)),))
 
+    # the two project-local lands: pad count and the land dimensions that were
+    # quoted from the data sheets, read back out of the board
+    fps = {f.GetReference(): f for f in board.GetFootprints()}
+    for ref, n, span_x, span_y in (("L1", 4, 4.1, 1.6),
+                                   ("MOV1", 2, 1.2, 0.5),
+                                   ("MOV2", 2, 1.2, 0.5)):
+        f = fps[ref]
+        pads = list(f.Pads())
+        row("%s pads" % ref, "%d" % n, "%d" % len(pads),
+            (float(len(pads) - n),))
+        xs, ys = [], []
+        for pad in pads:
+            # undo the placement rotation: compare the land as drawn
+            p0 = pad.GetPos0()
+            sz = pad.GetSize()
+            xs += [pcbnew.ToMM(p0.x) - pcbnew.ToMM(sz.x) / 2.0,
+                   pcbnew.ToMM(p0.x) + pcbnew.ToMM(sz.x) / 2.0]
+            ys += [pcbnew.ToMM(p0.y) - pcbnew.ToMM(sz.y) / 2.0,
+                   pcbnew.ToMM(p0.y) + pcbnew.ToMM(sz.y) / 2.0]
+        row("%s land" % ref, "%.2f x %.2f" % (span_x, span_y),
+            "%.2f x %.2f" % (max(xs) - min(xs), max(ys) - min(ys)),
+            (max(xs) - min(xs) - span_x, max(ys) - min(ys) - span_y))
+
+    # the all-layer void must cover the choke and not much else
+    vx0, vy0, vx1, vy1 = CMC_VOID
+    row("CMC void", "%.2f x %.2f (part +%.2f)"
+        % (2.7 + 2 * CMC_MARGIN, 3.9 + 2 * CMC_MARGIN, CMC_MARGIN),
+        "%.2f x %.2f" % (vx1 - vx0, vy1 - vy0),
+        (vx1 - vx0 - (2.7 + 2 * CMC_MARGIN),
+         vy1 - vy0 - (3.9 + 2 * CMC_MARGIN)))
+
     w = [max(len(str(r[i])) for r in rows) for i in range(5)]
     hdr = ("feature", "spec (mm)", "in .kicad_pcb (mm)", "delta", "")
     w = [max(w[i], len(hdr[i])) for i in range(5)]
@@ -1754,6 +2116,7 @@ def export_all():
 
 def main():
     write_symbol_lib()
+    write_footprint_lib()
     write_schematic()
     write_project()
     write_lib_tables()
