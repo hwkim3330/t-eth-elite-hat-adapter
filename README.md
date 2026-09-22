@@ -41,8 +41,12 @@ reasons it doesn't are worth stating up front:
    from the near pair, i.e. at y = 53.63 in the Elite's frame — past the Elite's
    own board edge at 49.19. There is nothing there to screw into.
 
-So the adapter is not a convenience. It is a notch and two mounting holes, and
-without them the HAT physically cannot sit on this board.
+Of those, only (4) genuinely needs a board. A tall enough stacking header would
+lift a HAT clear of the RJ45 on its own — so the honest claim is not "a HAT
+cannot sit on this board", it is that without the adapter a HAT sits on **two
+screws at the connector end and nothing at the other**, with the Elite's BOOT
+and RESET switches buried underneath it. On a board you push terminal-block
+levers into, that is the difference between a fixture and a wobble.
 
 ## Provenance
 
